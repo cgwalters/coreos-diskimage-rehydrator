@@ -6,9 +6,9 @@ const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) struct Chunk {
-    crc: u32,
-    start: u64,
-    ofs: u64,
+    pub(crate) crc: u32,
+    pub(crate) start: u64,
+    pub(crate) ofs: u64,
 }
 
 pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> BTreeMap<u32, Vec<Chunk>> {
