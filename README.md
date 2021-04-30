@@ -4,23 +4,29 @@ Part of implementing https://github.com/openshift/enhancements/pull/201
 
 The basic idea here is: Ship a container image that contains:
 
- - The OS update data (an ostree commit)
  - This executable
- - Extra "recipe" sufficient to generate ideally all the disk images, from
+ - A "base image" used to generate others (may be qemu or ISO, see below)
+ - Extra "recipe" sufficient to generate all the other disk images on demand, from
    the `-qemu.qcow2` and the `-aws.vmdk` disk images, the `.iso` etc - but without
    duplicating all the disk image data entirely as that would add up *fast*.
 
-## First approach: reuse "coreos-installer osmet" to synthesize the qemu.qcow2 from the ostree data
+# Requirement: Bit-for-bit uncompressed SHA-256 match
 
-https://github.com/coreos/coreos-installer/blob/master/docs/osmet.md
+Our CI tests the disk images.  In order to ensure that we're
+re-generating what we tested, it's very imporant that the
+uncompressed SHA-256 match.
 
-This would be ideal if we can directly generate the `-qemu.qcow2` from
-the ostree data.  There are some differences here though; in this
-case we have an archive mode ostree repo (currently).
+## Image differences
 
-But, failing that it won't be the end of the world if we punt on
-this and ship a "base image" whether that's the `-qemu.qcow2` or the `.iso`
-or whatever separately from the ostree update, and use that as the source.
+The `-openstack.qcow2` and the `-qemu.qcow2` only differ in the
+`ignition.platform.id` in the boot partition that is written
+by https://github.com/coreos/coreos-assembler/blob/master/src/gf-platformid
+
+However, the way we replace this also causes e.g. filesystem metadata (extents, timestamps)
+to change.
+
+Plus, on s390x we need to rerun `zipl` which changes another bit of
+data.
 
 ## Compression
 
@@ -30,21 +36,47 @@ See https://manpages.debian.org/unstable/pristine-tar/pristine-tar.1.en.html
 Our initial goal will be to generate *uncompressed* images, and verify
 the uncompressed SHA-256 matches.  That's all we need to be sure we've
 generated the same thing - we don't need to replicate the compression exactly.
+We can trust our compression tools.
 
-Hence, while we ship e.g. `-qemu.qcow2.xz`, we will primarily operate on
-`-qemu.qcow2`.
+Hence, while we ship e.g. `-qemu.qcow2.xz` (or `.gz` for RHCOS currently),
+we will primarily generate e.g. `-qemu.qcow2` and for callers that want
+it compressed, we may pass it to `gzip -1` or so.
 
-## Differences: ignition.platform.id
+## First approach: Add the -qemu.qcow2 image and use rsync to regenerate most images
 
-The `-openstack.qcow2` and the `-qemu.qcow2` only differ in the
-`ignition.platform.id` in the boot partition that is written
-by https://github.com/coreos/coreos-assembler/blob/master/src/gf-platformid
+A lowest common denominator to de-duplicate these is rsync-style rolling
+checksums.  This approach is also used by ostree "baseline" deltas, although
+it can also use bsdiff.
 
-Let's start there - can we do a binary diff between the two images
-and generate a small "recipe" that reliably resythesizes the `-openstack.qcow2`
-from the `-qemu.qcow2`?
+## Other approach: Reuse oscontainer content
 
-Hopefully the differences are small.
+We need to have a separate container image from `machine-os-content` in the RHCOS case,
+because today any change to `machine-os-content` will cause nodes to update on *all platforms*.  But we
+don't want to force every machine to reboot just because we needed to respin the
+vsphere OVA!
+
+However, what may work well is to have our image do
+`FROM quay.io/openshift/machine-os-content@sha256:...`
+
+Today the rhcos oscontainer is an "archive" mode repo (each file individually compressed).
+In the future with ostree-ext containers we'll have an uncompressed repo, which
+will be easier to use as a deduplication source.
+
+Either way, what may work is to e.g. generate a delta from "oscontainer stream" (tarball e.g.)
+to the metal/qcow2 image, and then deltas from that to other images.
+
+## Related: osmet?
+
+https://github.com/coreos/coreos-installer/blob/master/docs/osmet.md
+
+We could be much smarter about our deltas with an osmet-style approach.  We even ship the ISO
+which has osmet for the metal images inside it.
+
+So a simple approach could be to ship the ISO as the basis, and launch it in qemu to
+have it generate the metal image.  Then we use the metal image as an rsync-style rolling
+basis for everything else.
+
+See below for more on the ISO.
 
 ## VMDK
 
@@ -58,20 +90,21 @@ $ qemu-img convert -O vmdk -f qcow2 -o adapter_type=lsilogic,subformat=streamOpt
 And this `streamOptimized` bit seems to turn on internal compression.
 Further, there's a bit of random data generated during this process:
 https://github.com/qemu/qemu/blob/266469947161aa10b1d36843580d369d5aa38589/block/vmdk.c#L2519
+(Which will be handled by the rsync-style delta)
 
-So...a strategy here may be to:
-
-- Patch the platform ID as above
-- run the `qemu-img convert` invocation above
-- Have a postprocessing step that patches the `CID` to the originally known value
-  stored in the residue (or we could just make it zeroed initially in cosa builds?)
+For now, let's hardcode the qemu options for these two here again.  But longer
+term perhaps we fork off `qemu-img info` to try to gather this, or change coreos-assembler
+to include the `qemu-img` options used to generate the image.
 
 ## ISO
 
-Going to be very hard because I doubt squashfs is reproducible at all.  We may
-need to just punt on this and ship the ISO as is.  Which, in turn may inform
-whether it should actually be the source image?
+The structure of the ISO is mostly a wrapper for `images/pxeboot/rootfs.img` which 
+is a CPIO blob which contains a `squashfs` plus the osmet glue.
 
+Reproducing squashfs bit may require using a fork: 
+
+- https://github.com/NixOS/nixpkgs/issues/40144
+- https://reproducible-builds.org/docs/system-images/
 
 ### What is "rehydration"?
 
