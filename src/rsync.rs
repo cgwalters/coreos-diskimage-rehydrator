@@ -1,19 +1,20 @@
 //use rayon::prelude::*;
-use std::{collections::BTreeMap, convert::TryInto};
+use std::collections::HashMap;
+use std::convert::TryInto;
 
 use crate::bupsplit;
 
 const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) struct Chunk {
+pub(crate) struct Chunk<'a> {
     pub(crate) crc: u32,
     pub(crate) start: u64,
-    pub(crate) len: u64,
+    pub(crate) buf: &'a [u8],
 }
 
-pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> BTreeMap<u32, Vec<Chunk>> {
-    let mut ret = BTreeMap::<u32, Vec<Chunk>>::new();
+pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<u32, Vec<Chunk>> {
+    let mut ret = HashMap::<u32, Vec<Chunk>>::new();
     let mut done = false;
     let mut start = 0u64;
     while !buf.is_empty() {
@@ -28,15 +29,16 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> BTreeMap<u32, Vec<Chunk>> 
             }
         };
         let ofs = ofs.min(ROLLSUM_BLOB_MAX);
+        let sub_buf = &buf[..ofs];
         let mut crc = crc32fast::Hasher::new();
-        crc.update(&buf[..ofs]);
+        crc.update(sub_buf);
         let crc = crc.finalize();
 
         let v = ret.entry(crc).or_default();
         v.push(Chunk {
             crc,
             start,
-            len: ofs as u64,
+            buf: sub_buf,
         });
         start += ofs as u64;
         buf = &buf[ofs..]
@@ -54,21 +56,20 @@ pub(crate) struct RollsumDeltaStats {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct RollsumDelta {
-    pub(crate) matches: Vec<Match>,
+pub(crate) struct RollsumDelta<'a> {
+    pub(crate) matches: Vec<Match<'a>>,
 
     pub(crate) stats: RollsumDeltaStats,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct Match {
-    pub(crate) crc: u32,
-    pub(crate) len: u64,
+pub(crate) struct Match<'a> {
+    pub(crate) buf: &'a [u8],
     pub(crate) src_start: u64,
     pub(crate) dest_start: u64,
 }
 
-pub(crate) fn rollsum_delta(src: &[u8], dest: &[u8]) -> RollsumDelta {
+pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> {
     let mut delta: RollsumDelta = Default::default();
     let src_chunkset = rollsum_chunks_crc32(&src);
     let dest_chunkset = rollsum_chunks_crc32(&dest);
@@ -83,29 +84,24 @@ pub(crate) fn rollsum_delta(src: &[u8], dest: &[u8]) -> RollsumDelta {
                     debug_assert_eq!(src_chunk.crc, dest_chunk.crc);
 
                     // Same crc32 but different length, skip it.
-                    if src_chunk.len != dest_chunk.len {
+                    if src_chunk.buf.len() != dest_chunk.buf.len() {
                         delta.stats.crc_len_collision += 1;
                         continue;
                     }
 
-                    let len = src_chunk.len;
+                    let len = src_chunk.buf.len();
                     assert!(len > 0);
-                    let src_start = src_chunk.start;
-                    let dest_start = dest_chunk.start;
-                    let srcbuf = &src[src_start as usize..(src_start + len) as usize];
-                    let destbuf = &dest[dest_start as usize..(dest_start + len) as usize];
-                    if srcbuf != destbuf {
+                    if src_chunk.buf != dest_chunk.buf {
                         delta.stats.crc_collision += 1;
                         continue;
                     }
 
                     delta.matches.push(Match {
-                        crc,
-                        len,
-                        src_start,
-                        dest_start,
+                        buf: src_chunk.buf,
+                        src_start: src_chunk.start,
+                        dest_start: dest_chunk.start,
                     });
-                    delta.stats.match_size += len;
+                    delta.stats.match_size += len as u64;
                 }
             }
         }
@@ -130,8 +126,7 @@ mod test {
         assert_eq!(
             &delta.matches[0],
             &Match {
-                crc: 163128923,
-                len: 1,
+                buf: single,
                 src_start: 0,
                 dest_start: 0,
             }

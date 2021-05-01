@@ -73,6 +73,7 @@ impl Rollsum {
         );
     }
 
+    #[inline(always)]
     fn roll(&mut self, ch: u8) -> () {
         let wofs = self.wofs as usize;
         let dval = self.window[wofs];
@@ -81,11 +82,13 @@ impl Rollsum {
         self.wofs = (self.wofs + 1) % (BUP_WINDOWSIZE as i32);
     }
 
+    #[allow(dead_code)]
     fn digest(&self) -> u32 {
         (self.s1 << 16) | (self.s2 & 0xFFFF)
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn bupsplit_sum(buf: &[u8]) -> u32 {
     let mut r = Rollsum::new();
     for x in buf {
