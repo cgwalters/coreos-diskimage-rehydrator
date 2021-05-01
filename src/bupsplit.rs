@@ -99,7 +99,7 @@ pub(crate) fn bupsplit_find_ofs(sbuf: &[u8]) -> Option<usize> {
     for (offset, x) in sbuf.iter().enumerate() {
         r.roll(*x);
         if (r.s2 & (BUP_BLOBSIZE - 1)) == ((u32::max_value()) & (BUP_BLOBSIZE - 1)) {
-            return Some(offset);
+            return Some(offset + 1);
         }
     }
     None
