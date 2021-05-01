@@ -1,5 +1,5 @@
 //use rayon::prelude::*;
-use std::collections::HashMap;
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::convert::TryInto;
 
 use crate::bupsplit;
@@ -49,15 +49,17 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<u32, Vec<Chunk>> {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RollsumDeltaStats {
     pub(crate) match_size: u64,
+    pub(crate) crc_miss: u32,
     pub(crate) crc_len_collision: u32,
     pub(crate) crc_collision: u32,
     pub(crate) src_chunks: u32,
     pub(crate) dest_chunks: u32,
+    pub(crate) dest_size: u64,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct RollsumDelta<'a> {
-    pub(crate) matches: Vec<Match<'a>>,
+    pub(crate) matches: BTreeMap<u64, Match<'a>>,
 
     pub(crate) stats: RollsumDeltaStats,
 }
@@ -76,6 +78,7 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
 
     delta.stats.src_chunks = src_chunkset.len().try_into().unwrap();
     delta.stats.dest_chunks = dest_chunkset.len().try_into().unwrap();
+    delta.stats.dest_size = dest.len() as u64;
 
     for (&crc, dest_chunks) in dest_chunkset.iter() {
         if let Some(src_chunks) = src_chunkset.get(&crc) {
@@ -96,14 +99,21 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
                         continue;
                     }
 
-                    delta.matches.push(Match {
-                        buf: src_chunk.buf,
-                        src_start: src_chunk.start,
-                        dest_start: dest_chunk.start,
-                    });
-                    delta.stats.match_size += len as u64;
+                    match delta.matches.entry(dest_chunk.start) {
+                        Entry::Vacant(e) => {
+                            e.insert(Match {
+                                buf: src_chunk.buf,
+                                src_start: src_chunk.start,
+                                dest_start: dest_chunk.start,
+                            });
+                            delta.stats.match_size += len as u64;
+                        }
+                        Entry::Occupied(_) => {}
+                    }
                 }
             }
+        } else {
+            delta.stats.crc_miss += 1;
         }
     }
 
@@ -124,7 +134,7 @@ mod test {
         let delta = rollsum_delta(single, single);
         assert_eq!(delta.matches.len(), 1);
         assert_eq!(
-            &delta.matches[0],
+            delta.matches.get(&0).unwrap(),
             &Match {
                 buf: single,
                 src_start: 0,
