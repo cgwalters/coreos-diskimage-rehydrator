@@ -1,4 +1,5 @@
 //use rayon::prelude::*;
+use serde_derive::{Deserialize, Serialize};
 use std::collections::{btree_map::Entry, BTreeMap, HashMap};
 use std::convert::TryInto;
 
@@ -6,14 +7,16 @@ use crate::bupsplit;
 
 const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
 
-#[derive(Debug, Copy, Clone)]
+type CRC32Value = u32;
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct Chunk<'a> {
-    pub(crate) crc: u32,
     pub(crate) start: u64,
     pub(crate) buf: &'a [u8],
 }
 
-pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<u32, Vec<Chunk>> {
+/// Create a mapping from CRC32 values to byte array chunks that match it.
+pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<CRC32Value, Vec<Chunk>> {
     let mut ret = HashMap::<u32, Vec<Chunk>>::new();
     let mut done = false;
     let mut start = 0u64;
@@ -36,7 +39,6 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<u32, Vec<Chunk>> {
 
         let v = ret.entry(crc).or_default();
         v.push(Chunk {
-            crc,
             start,
             buf: sub_buf,
         });
@@ -46,6 +48,7 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<u32, Vec<Chunk>> {
     ret
 }
 
+/// Statistics.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RollsumDeltaStats {
     pub(crate) match_size: u64,
@@ -57,20 +60,25 @@ pub(crate) struct RollsumDeltaStats {
     pub(crate) dest_size: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct Patch {
+    chunks: Vec<PatchEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) enum PatchEntry {
+    Literal { start: u64, len: u64 },
+    Copy { start: u64, len: u64 },
+}
+
+/// rsync-style delta between two byte buffers.
 #[derive(Debug, Default)]
 pub(crate) struct RollsumDelta<'a> {
-    pub(crate) matches: BTreeMap<u64, Match<'a>>,
-
+    pub(crate) matches: BTreeMap<u64, Chunk<'a>>,
     pub(crate) stats: RollsumDeltaStats,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) struct Match<'a> {
-    pub(crate) buf: &'a [u8],
-    pub(crate) src_start: u64,
-    pub(crate) dest_start: u64,
-}
-
+/// Compute an rsync-style delta between src and dest.
 pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> {
     let mut delta: RollsumDelta = Default::default();
     let src_chunkset = rollsum_chunks_crc32(&src);
@@ -80,35 +88,51 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
     delta.stats.dest_chunks = dest_chunkset.len().try_into().unwrap();
     delta.stats.dest_size = dest.len() as u64;
 
+    // We now have a mapping [CRC32] -> Vec<Chunk> for both source+destination.
+    // The goal is to find chunks in the source that we can reuse.
     for (&crc, dest_chunks) in dest_chunkset.iter() {
+        // Check to see if there are any chunks that match that CRC32 in the source.
         if let Some(src_chunks) = src_chunkset.get(&crc) {
+            let mut found = false;
+            // Loop over the source and destination chunks that match that CRC32
             for src_chunk in src_chunks.iter() {
+                if found {
+                    break
+                }
                 for dest_chunk in dest_chunks.iter() {
-                    debug_assert_eq!(src_chunk.crc, dest_chunk.crc);
-
-                    // Same crc32 but different length, skip it.
+                    // Same CRC32 but different length, skip it.
                     if src_chunk.buf.len() != dest_chunk.buf.len() {
                         delta.stats.crc_len_collision += 1;
                         continue;
                     }
 
-                    let len = src_chunk.buf.len();
-                    assert!(len > 0);
-                    if src_chunk.buf != dest_chunk.buf {
-                        delta.stats.crc_collision += 1;
-                        continue;
-                    }
-
+                    // It's possible that the destination has duplicate
+                    // data; for example, uncompressed disk images may have
+                    // large runs of zero bytes.  Hence we now look to
+                    // see if we already found a match for this range in the
+                    // destination.  If so, we're done.  If not, do
+                    // a more expensive check to see if the buffer actually matches.
                     match delta.matches.entry(dest_chunk.start) {
                         Entry::Vacant(e) => {
-                            e.insert(Match {
+                            let len = src_chunk.buf.len();
+                            assert!(len > 0);
+                            // Directly compare the buffers.  If they're not equal, then
+                            // we obviously can't reuse it.  rsync uses md5 here, but
+                            // let's go for maximum reliablity and just bytewise compare.
+                            if src_chunk.buf != dest_chunk.buf {
+                                delta.stats.crc_collision += 1;
+                                continue;
+                            }
+                            e.insert(Chunk {
                                 buf: src_chunk.buf,
-                                src_start: src_chunk.start,
-                                dest_start: dest_chunk.start,
+                                start: src_chunk.start,
                             });
                             delta.stats.match_size += len as u64;
+                            found = true;
                         }
-                        Entry::Occupied(_) => {}
+                        Entry::Occupied(_) => {
+                            panic!("Duplicate destination offset {}", dest_chunk.start);
+                        }
                     }
                 }
             }
@@ -118,6 +142,22 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
     }
 
     delta
+}
+
+impl Patch {
+    pub(crate) fn new(src: &[u8], dest: &[u8]) -> (Self, RollsumDeltaStats) {
+        let delta = rollsum_delta(src, dest);
+        let mut buf = Vec::<u8>::new();
+        let mut start = 0u64;
+        for (entry_start, entry_match) in delta.matches {
+            if entry_start != start {
+                debug_assert!(start < entry_start);
+                buf.extend(&dest[start as usize..entry_start as usize]);
+                start = entry_start;
+            }
+        }
+        todo!()
+    }
 }
 
 #[cfg(test)]
@@ -135,10 +175,9 @@ mod test {
         assert_eq!(delta.matches.len(), 1);
         assert_eq!(
             delta.matches.get(&0).unwrap(),
-            &Match {
+            &Chunk {
                 buf: single,
-                src_start: 0,
-                dest_start: 0,
+                start: 0,
             }
         );
         let delta = rollsum_delta(empty, single);
