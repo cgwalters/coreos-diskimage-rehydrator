@@ -42,7 +42,7 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<ChunkId, Vec<Chunk
         let crc = crc.finalize();
         let chunkid = ChunkId {
             crc32: crc,
-            len: buf.len().try_into().unwrap(),
+            len: sub_buf.len().try_into().unwrap(),
         };
 
         let v = ret.entry(chunkid).or_default();
