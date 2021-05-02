@@ -73,13 +73,14 @@ pub(crate) enum PatchEntry {
 
 /// rsync-style delta between two byte buffers.
 #[derive(Debug, Default)]
-pub(crate) struct RollsumDelta<'a> {
-    pub(crate) matches: BTreeMap<u64, Chunk<'a>>,
+pub(crate) struct RollsumDelta<'src, 'dest> {
+    pub(crate) matches: BTreeMap<u64, Chunk<'src>>,
+    pub(crate) unmatched: BTreeMap<u64, Chunk<'dest>>,
     pub(crate) stats: RollsumDeltaStats,
 }
 
 /// Compute an rsync-style delta between src and dest.
-pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> {
+pub(crate) fn rollsum_delta<'src, 'dest>(src: &'src [u8], dest: &'dest [u8]) -> RollsumDelta<'src, 'dest> {
     let mut delta: RollsumDelta = Default::default();
     let src_chunkset = rollsum_chunks_crc32(&src);
     let dest_chunkset = rollsum_chunks_crc32(&dest);
@@ -90,10 +91,10 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
 
     // We now have a mapping [CRC32] -> Vec<Chunk> for both source+destination.
     // The goal is to find chunks in the source that we can reuse.
-    for (&crc, dest_chunks) in dest_chunkset.iter() {
+    for (crc, dest_chunks) in dest_chunkset.into_iter() {
+        let mut found = false;
         // Check to see if there are any chunks that match that CRC32 in the source.
         if let Some(src_chunks) = src_chunkset.get(&crc) {
-            let mut found = false;
             // Loop over the source and destination chunks that match that CRC32
             for src_chunk in src_chunks.iter() {
                 if found {
@@ -129,6 +130,7 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
                             });
                             delta.stats.match_size += len as u64;
                             found = true;
+                            break
                         }
                         Entry::Occupied(_) => {
                             panic!("Duplicate destination offset {}", dest_chunk.start);
@@ -138,6 +140,12 @@ pub(crate) fn rollsum_delta<'a>(src: &'a [u8], dest: &[u8]) -> RollsumDelta<'a> 
             }
         } else {
             delta.stats.crc_miss += 1;
+        }
+        if !found {
+            for dest_chunk in dest_chunks {
+                let existed = delta.unmatched.insert(dest_chunk.start, dest_chunk);
+                assert!(!existed.is_some());
+            }
         }
     }
 
