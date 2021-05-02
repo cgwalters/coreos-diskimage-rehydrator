@@ -7,7 +7,11 @@ use crate::bupsplit;
 
 const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
 
-type CRC32Value = u32;
+#[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
+pub(crate) struct ChunkId {
+    pub(crate) crc32: u32,
+    pub(crate) len: u32,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub(crate) struct Chunk<'a> {
@@ -16,8 +20,8 @@ pub(crate) struct Chunk<'a> {
 }
 
 /// Create a mapping from CRC32 values to byte array chunks that match it.
-pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<CRC32Value, Vec<Chunk>> {
-    let mut ret = HashMap::<u32, Vec<Chunk>>::new();
+pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<ChunkId, Vec<Chunk>> {
+    let mut ret = HashMap::<ChunkId, Vec<Chunk>>::new();
     let mut done = false;
     let mut start = 0u64;
     while !buf.is_empty() {
@@ -36,8 +40,12 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<CRC32Value, Vec<Ch
         let mut crc = crc32fast::Hasher::new();
         crc.update(sub_buf);
         let crc = crc.finalize();
+        let chunkid = ChunkId {
+            crc32: crc,
+            len: buf.len().try_into().unwrap(),
+        };
 
-        let v = ret.entry(crc).or_default();
+        let v = ret.entry(chunkid).or_default();
         v.push(Chunk {
             start,
             buf: sub_buf,
@@ -51,10 +59,10 @@ pub(crate) fn rollsum_chunks_crc32(mut buf: &[u8]) -> HashMap<CRC32Value, Vec<Ch
 /// Statistics.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RollsumDeltaStats {
-    pub(crate) match_size: u64,
+    pub(crate) matched_size: u64,
+    pub(crate) unmatched_size: u64,
     pub(crate) crc_miss: u32,
-    pub(crate) crc_len_collision: u32,
-    pub(crate) crc_collision: u32,
+    pub(crate) chunkid_collision: u32,
     pub(crate) src_chunks: u32,
     pub(crate) dest_chunks: u32,
     pub(crate) dest_size: u64,
@@ -80,7 +88,10 @@ pub(crate) struct RollsumDelta<'src, 'dest> {
 }
 
 /// Compute an rsync-style delta between src and dest.
-pub(crate) fn rollsum_delta<'src, 'dest>(src: &'src [u8], dest: &'dest [u8]) -> RollsumDelta<'src, 'dest> {
+pub(crate) fn rollsum_delta<'src, 'dest>(
+    src: &'src [u8],
+    dest: &'dest [u8],
+) -> RollsumDelta<'src, 'dest> {
     let mut delta: RollsumDelta = Default::default();
     let src_chunkset = rollsum_chunks_crc32(&src);
     let dest_chunkset = rollsum_chunks_crc32(&dest);
@@ -91,22 +102,13 @@ pub(crate) fn rollsum_delta<'src, 'dest>(src: &'src [u8], dest: &'dest [u8]) -> 
 
     // We now have a mapping [CRC32] -> Vec<Chunk> for both source+destination.
     // The goal is to find chunks in the source that we can reuse.
-    for (crc, dest_chunks) in dest_chunkset.into_iter() {
-        let mut found = false;
-        // Check to see if there are any chunks that match that CRC32 in the source.
-        if let Some(src_chunks) = src_chunkset.get(&crc) {
-            // Loop over the source and destination chunks that match that CRC32
-            for src_chunk in src_chunks.iter() {
-                if found {
-                    break
-                }
-                for dest_chunk in dest_chunks.iter() {
-                    // Same CRC32 but different length, skip it.
-                    if src_chunk.buf.len() != dest_chunk.buf.len() {
-                        delta.stats.crc_len_collision += 1;
-                        continue;
-                    }
-
+    for (chunkid, dest_chunks) in dest_chunkset.into_iter() {
+        for dest_chunk in dest_chunks {
+            let mut found = false;
+            // Check to see if there are any chunks that match that CRC32+len in the source.
+            if let Some(src_chunks) = src_chunkset.get(&chunkid) {
+                // Loop over the source and destination chunks that match that CRC32+len
+                for src_chunk in src_chunks.iter() {
                     // It's possible that the destination has duplicate
                     // data; for example, uncompressed disk images may have
                     // large runs of zero bytes.  Hence we now look to
@@ -121,29 +123,28 @@ pub(crate) fn rollsum_delta<'src, 'dest>(src: &'src [u8], dest: &'dest [u8]) -> 
                             // we obviously can't reuse it.  rsync uses md5 here, but
                             // let's go for maximum reliablity and just bytewise compare.
                             if src_chunk.buf != dest_chunk.buf {
-                                delta.stats.crc_collision += 1;
+                                delta.stats.chunkid_collision += 1;
                                 continue;
                             }
                             e.insert(Chunk {
                                 buf: src_chunk.buf,
                                 start: src_chunk.start,
                             });
-                            delta.stats.match_size += len as u64;
+                            delta.stats.matched_size += len as u64;
                             found = true;
-                            break
+                            break;
                         }
                         Entry::Occupied(_) => {
                             panic!("Duplicate destination offset {}", dest_chunk.start);
                         }
                     }
                 }
+            } else {
+                delta.stats.crc_miss += 1;
             }
-        } else {
-            delta.stats.crc_miss += 1;
-        }
-        if !found {
-            for dest_chunk in dest_chunks {
+            if !found {
                 let existed = delta.unmatched.insert(dest_chunk.start, dest_chunk);
+                delta.stats.unmatched_size += dest_chunk.buf.len() as u64;
                 assert!(!existed.is_some());
             }
         }
