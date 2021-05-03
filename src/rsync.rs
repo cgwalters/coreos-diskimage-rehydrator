@@ -2,8 +2,9 @@
 use anyhow::{anyhow, Result};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_derive::{Deserialize, Serialize};
-use std::{collections::{btree_map::Entry, BTreeMap, HashMap}, io::Read};
-use std::convert::TryInto;
+use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::convert::{TryFrom, TryInto};
+use std::io::Read;
 use std::io::Write;
 
 use crate::bupsplit;
@@ -214,6 +215,10 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
     out.write_all(HEADER.as_bytes())?;
     out.write_u64::<LittleEndian>(buflen)?;
 
+    for &chunk in delta.unmatched_chunks.iter() {
+        out.write_all(chunk)?;
+    }
+
     let mut patch = Patch {
         ..Default::default()
     };
@@ -254,7 +259,9 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
         };
     }
 
-    bincode::serialize_into(out, &patch)?;
+    bincode::serialize_into(&mut out, &patch)?;
+
+    out.finish()?;
 
     Ok(delta.stats)
 }
@@ -262,13 +269,17 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
 pub(crate) fn apply_patch(
     src: &[u8],
     patchfile: impl std::io::Read,
-    dest: impl std::io::Write,
+    mut dest: impl std::io::Write,
 ) -> Result<()> {
     let mut reader = zstd::Decoder::new(patchfile)?;
     let mut buf = [0u8; 4];
     reader.read_exact(&mut buf)?;
     if buf != HEADER.as_bytes() {
-        return Err(anyhow!("Invalid header, expecting '{}' found '{:?}'", HEADER, buf));
+        return Err(anyhow!(
+            "Invalid header, expecting '{}' found '{:?}'",
+            HEADER,
+            buf
+        ));
     }
     let buflen = reader.read_u64::<LittleEndian>()?;
     let (copybuf, reader) = {
@@ -276,13 +287,32 @@ pub(crate) fn apply_patch(
         let mut v = Vec::with_capacity(buflen.try_into().unwrap());
         let read = r.read_to_end(&mut v)? as u64;
         if read < buflen {
-            return Err(anyhow!("Input truncated, expecting {} bytes for buffer", buflen));
+            return Err(anyhow!(
+                "Input truncated, expecting {} bytes for buffer, got {}",
+                buflen, read
+            ));
         }
         debug_assert_eq!(read, buflen);
         (v, r.into_inner())
     };
     let patch: Patch = bincode::deserialize_from(reader)?;
-    todo!()
+    for entry in patch.chunks {
+        match entry {
+            PatchEntry::CopyBuf { start, len } => {
+                let start: usize = start.try_into().unwrap();
+                let end = start + usize::try_from(len).unwrap();
+                let buf = &copybuf[start..end];
+                dest.write_all(buf)?;
+            }
+            PatchEntry::CopySource { start, len } => {
+                let start: usize = start.try_into().unwrap();
+                let end = start + usize::try_from(len).unwrap();
+                let buf = &src[start..end];
+                dest.write_all(buf)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -319,7 +349,8 @@ mod test {
     }
 
     #[test]
-    fn test_delta_empty() {
+    fn test_delta_basic() {
         test_roundtrip(EMPTY, EMPTY);
+        test_roundtrip(SINGLE, SINGLE);
     }
 }
