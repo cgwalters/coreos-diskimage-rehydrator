@@ -11,9 +11,11 @@ use crate::bupsplit;
 const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
 const HEADER: &[u8] = b"DELT";
 
+type CRC32 = u32;
+
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Hash)]
 pub(crate) struct ChunkId {
-    pub(crate) crc32: u32,
+    pub(crate) crc32: CRC32,
     pub(crate) len: u32,
 }
 
@@ -69,6 +71,7 @@ pub(crate) struct RollsumDeltaStats {
     pub(crate) chunkid_collision: u32,
     pub(crate) src_chunks: u32,
     pub(crate) dest_chunks: u32,
+    pub(crate) dest_duplicates: u32,
     pub(crate) dest_size: u64,
 }
 
@@ -87,8 +90,30 @@ pub(crate) enum PatchEntry {
 #[derive(Debug, Default)]
 pub(crate) struct RollsumDelta<'src, 'dest> {
     pub(crate) matched: BTreeMap<u64, Chunk<'src>>,
-    pub(crate) unmatched: BTreeMap<u64, Chunk<'dest>>,
+    pub(crate) unmatched_chunks: Vec<&'dest [u8]>,
+    // Maps from offset into unmatched_chunks
+    pub(crate) unmatched: BTreeMap<u64, usize>,
     pub(crate) stats: RollsumDeltaStats,
+}
+
+fn dedup_chunks<'dest>(input: Vec<Chunk<'dest>>) -> (Vec<(u64, usize)>, Vec<&'dest [u8]>) {
+    let mut unique = Vec::<&[u8]>::new();
+    let mut ret = Vec::new();
+    for chunk in input {
+        let mut found = false;
+        for (i, &uniq) in unique.iter().enumerate() {
+            if chunk.buf == uniq {
+                ret.push((chunk.start, i));
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            unique.push(chunk.buf);
+            ret.push((chunk.start, unique.len() - 1));
+        }
+    }
+    (ret, unique)
 }
 
 /// Compute an rsync-style delta between src and dest.
@@ -105,10 +130,10 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
     delta.stats.dest_size = dest.len() as u64;
 
     // We now have a mapping [CRC32] -> Vec<Chunk> for both source+destination.
-    // The goal is to find chunks in the source that we can reuse.
-    for (chunkid, dest_chunks) in dest_chunkset.into_iter() {
-        for dest_chunk in dest_chunks {
-            let mut found = false;
+    // The goal is to find chunks in the source that we can reuse.  Retain
+    // in "dest_chunkset" all unmatched chunks
+    dest_chunkset.retain(|chunkid, dest_chunks| {
+        dest_chunks.retain(|dest_chunk| {
             // Check to see if there are any chunks that match that CRC32+len in the source.
             if let Some(src_chunks) = src_chunkset.get(&chunkid) {
                 // Loop over the source and destination chunks that match that CRC32+len
@@ -135,8 +160,8 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
                                 start: src_chunk.start,
                             });
                             delta.stats.matched_size += len as u64;
-                            found = true;
-                            break;
+                            // We found a match, so don't keep this one in the unmatched set
+                            return false;
                         }
                         Entry::Occupied(_) => {
                             panic!("Duplicate destination offset {}", dest_chunk.start);
@@ -146,12 +171,21 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
             } else {
                 delta.stats.crc_miss += 1;
             }
-            if !found {
-                let existed = delta.unmatched.insert(dest_chunk.start, dest_chunk);
-                delta.stats.unmatched_size += dest_chunk.buf.len() as u64;
-                assert!(!existed.is_some());
-            }
-        }
+            true
+        });
+        // If we found matches for all chunks, remove this entry
+        !dest_chunks.is_empty()
+    });
+
+    for (chunkid, dest_chunks) in dest_chunkset.into_iter() {
+        let origlen = dest_chunks.len();
+        let (dest_chunks, bufs) = dedup_chunks(dest_chunks);
+        delta.stats.dest_duplicates += origlen.checked_sub(dest_chunks.len()).unwrap() as u32;
+        let offset = delta.unmatched_chunks.len();
+        delta.unmatched_chunks.extend(bufs);
+        delta.unmatched.extend(dest_chunks.into_iter().map(|(s, o)| {
+            (s, o + offset)
+        }));
     }
 
     delta
@@ -168,9 +202,11 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
     let mut out = zstd::Encoder::new(out, 15)?;
 
     let buflen = delta
-        .unmatched
+        .unmatched_chunks
         .iter()
-        .fold(0u64, |acc, unmatched| acc + unmatched.1.buf.len() as u64);
+        .fold(0u64, |acc, &unmatched| acc + unmatched.len() as u64);
+    let unmatched_chunk_offsets = 
+    let mut buf_offset = 0u64;
 
     out.write_all(HEADER)?;
     out.write_u64::<LittleEndian>(buflen)?;
@@ -218,6 +254,8 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
             EitherOrBoth::Right(unmatched) => patch.chunks.push(unmatched?.1),
         };
     }
+
+    assert_eq!(buf_offset, buflen);    
 
     bincode::serialize_into(out, &patch)?;
 
