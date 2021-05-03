@@ -18,17 +18,39 @@ struct DehydrateOpts {
 }
 
 #[derive(Debug, StructOpt)]
+struct RehydrateOpts {
+    /// Path to qemu image
+    src_qemu: String,
+
+    patch: String,
+
+    output: String,
+}
+
+#[derive(Debug, StructOpt)]
 #[structopt(name = "coreos-diskimage-rehydrator")]
 #[structopt(rename_all = "kebab-case")]
 enum Opt {
     /// Generate "dehydration files"
     Dehydrate(DehydrateOpts),
+    /// Regenerate target file
+    Rehydrate(RehydrateOpts),
 }
 
 fn run() -> Result<()> {
     match Opt::from_args() {
         Opt::Dehydrate(ref opts) => dehydrate(opts),
+        Opt::Rehydrate(ref opts) => rehydrate(opts),
     }
+}
+
+fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
+    let src = mmap(opts.src_qemu.as_str())?;
+    let patch = File::open(opts.patch.as_str())?;
+    let mut output = File::create(opts.output.as_str())?;
+    rsync::apply_patch(&src, patch, &mut output)?;
+    output.flush()?;
+    Ok(())
 }
 
 fn mmap<P: AsRef<Path>>(p: P) -> Result<Mmap> {

@@ -1,15 +1,15 @@
 //use rayon::prelude::*;
-use anyhow::Result;
-use byteorder::{LittleEndian, WriteBytesExt};
+use anyhow::{anyhow, Result};
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use serde_derive::{Deserialize, Serialize};
-use std::collections::{btree_map::Entry, BTreeMap, HashMap};
+use std::{collections::{btree_map::Entry, BTreeMap, HashMap}, io::Read};
 use std::convert::TryInto;
 use std::io::Write;
 
 use crate::bupsplit;
 
 const ROLLSUM_BLOB_MAX: usize = 8192 * 4;
-const HEADER: &[u8] = b"DELT";
+const HEADER: &str = "DELT";
 
 type CRC32 = u32;
 
@@ -179,9 +179,11 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
 
     for (_, dest_chunks) in dest_chunkset.into_iter() {
         let origlen = dest_chunks.len();
-        delta.stats.unmatched_size += dest_chunks.iter().fold(0u64, |acc, chunk| acc + chunk.buf.len() as u64);
+        delta.stats.unmatched_size += dest_chunks
+            .iter()
+            .fold(0u64, |acc, chunk| acc + chunk.buf.len() as u64);
         let (dest_chunks, bufs) = dedup_chunks(dest_chunks);
-        delta.stats.dest_duplicates += origlen.checked_sub(dest_chunks.len()).unwrap() as u32;
+        delta.stats.dest_duplicates += origlen.checked_sub(bufs.len()).unwrap() as u32;
         let offset = delta.unmatched_chunks.len();
         delta.unmatched_chunks.extend(bufs);
         delta
@@ -209,7 +211,7 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
         buflen += chunk.len() as u64;
     }
 
-    out.write_all(HEADER)?;
+    out.write_all(HEADER.as_bytes())?;
     out.write_u64::<LittleEndian>(buflen)?;
 
     let mut patch = Patch {
@@ -229,7 +231,10 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
         let e = e.map_right(|(&start, &bufidx)| {
             let len = delta.unmatched_chunks[bufidx].len() as u64;
             let &buf_start = chunk_offsets.get(&bufidx).unwrap();
-            let p = PatchEntry::CopyBuf { start: buf_start, len };
+            let p = PatchEntry::CopyBuf {
+                start: buf_start,
+                len,
+            };
             (start, p)
         });
         match e {
@@ -254,27 +259,67 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
     Ok(delta.stats)
 }
 
+pub(crate) fn apply_patch(
+    src: &[u8],
+    patchfile: impl std::io::Read,
+    dest: impl std::io::Write,
+) -> Result<()> {
+    let mut reader = zstd::Decoder::new(patchfile)?;
+    let mut buf = [0u8; 4];
+    reader.read_exact(&mut buf)?;
+    if buf != HEADER.as_bytes() {
+        return Err(anyhow!("Invalid header, expecting '{}' found '{:?}'", HEADER, buf));
+    }
+    let buflen = reader.read_u64::<LittleEndian>()?;
+    let (copybuf, reader) = {
+        let mut r = reader.take(buflen);
+        let mut v = Vec::with_capacity(buflen.try_into().unwrap());
+        let read = r.read_to_end(&mut v)? as u64;
+        if read < buflen {
+            return Err(anyhow!("Input truncated, expecting {} bytes for buffer", buflen));
+        }
+        debug_assert_eq!(read, buflen);
+        (v, r.into_inner())
+    };
+    let patch: Patch = bincode::deserialize_from(reader)?;
+    todo!()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
+    const EMPTY: &[u8] = &[];
+    const SINGLE: &[u8] = &[42u8];
+
+    fn test_roundtrip(src: &[u8], dest: &[u8]) -> RollsumDeltaStats {
+        let mut delta = Vec::new();
+        let mut target = Vec::new();
+        let stats = super::create_patchfile(src, dest, &mut delta).unwrap();
+        super::apply_patch(src, delta.as_slice(), &mut target).unwrap();
+
+        stats
+    }
+
     #[test]
     fn test_rollsum() {
-        let empty: &[u8] = &[];
-        let single = &[42u8];
-
-        let delta = rollsum_delta(empty, empty);
+        let delta = rollsum_delta(EMPTY, EMPTY);
         assert_eq!(delta.matched.len(), 0);
-        let delta = rollsum_delta(single, single);
+        let delta = rollsum_delta(SINGLE, SINGLE);
         assert_eq!(delta.matched.len(), 1);
         assert_eq!(
             delta.matched.get(&0).unwrap(),
             &Chunk {
-                buf: single,
+                buf: SINGLE,
                 start: 0,
             }
         );
-        let delta = rollsum_delta(empty, single);
+        let delta = rollsum_delta(EMPTY, SINGLE);
         assert_eq!(delta.matched.len(), 0);
+    }
+
+    #[test]
+    fn test_delta_empty() {
+        test_roundtrip(EMPTY, EMPTY);
     }
 }
