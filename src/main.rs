@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::{fs::File, io::Write, path::Path};
 
 use anyhow::Result;
 use memmap2::{Mmap, MmapOptions};
@@ -13,6 +13,8 @@ struct DehydrateOpts {
     src_qemu: String,
 
     dest_img: String,
+
+    output: String,
 }
 
 #[derive(Debug, StructOpt)]
@@ -39,9 +41,15 @@ fn dehydrate(opts: &DehydrateOpts) -> Result<()> {
     let src = mmap(opts.src_qemu.as_str())?;
     let dest = mmap(opts.dest_img.as_str())?;
 
-    let delta = rsync::rollsum_delta(&src, &dest);
+    let mut output = File::create(opts.output.as_str())?;
+    let stats = rsync::create_patchfile(&src, &dest, &mut output)?;
+    output.flush()?;
 
-    println!("{:?}", delta.stats);
+    println!("{:?}", stats);
+    assert_eq!(
+        dest.len() as u64,
+        stats.matched_size + stats.unmatched_size
+    );
 
     Ok(())
 }
