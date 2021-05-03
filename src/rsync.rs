@@ -123,7 +123,7 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
 ) -> RollsumDelta<'src, 'dest> {
     let mut delta: RollsumDelta = Default::default();
     let src_chunkset = rollsum_chunks_crc32(&src);
-    let dest_chunkset = rollsum_chunks_crc32(&dest);
+    let mut dest_chunkset = rollsum_chunks_crc32(&dest);
 
     delta.stats.src_chunks = src_chunkset.len().try_into().unwrap();
     delta.stats.dest_chunks = dest_chunkset.len().try_into().unwrap();
@@ -177,15 +177,16 @@ pub(crate) fn rollsum_delta<'src, 'dest>(
         !dest_chunks.is_empty()
     });
 
-    for (chunkid, dest_chunks) in dest_chunkset.into_iter() {
+    for (_, dest_chunks) in dest_chunkset.into_iter() {
         let origlen = dest_chunks.len();
+        delta.stats.unmatched_size += dest_chunks.iter().fold(0u64, |acc, chunk| acc + chunk.buf.len() as u64);
         let (dest_chunks, bufs) = dedup_chunks(dest_chunks);
         delta.stats.dest_duplicates += origlen.checked_sub(dest_chunks.len()).unwrap() as u32;
         let offset = delta.unmatched_chunks.len();
         delta.unmatched_chunks.extend(bufs);
-        delta.unmatched.extend(dest_chunks.into_iter().map(|(s, o)| {
-            (s, o + offset)
-        }));
+        delta
+            .unmatched
+            .extend(dest_chunks.into_iter().map(|(s, o)| (s, o + offset)));
     }
 
     delta
@@ -201,12 +202,12 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
 
     let mut out = zstd::Encoder::new(out, 15)?;
 
-    let buflen = delta
-        .unmatched_chunks
-        .iter()
-        .fold(0u64, |acc, &unmatched| acc + unmatched.len() as u64);
-    let unmatched_chunk_offsets = 
-    let mut buf_offset = 0u64;
+    let mut buflen = 0u64;
+    let mut chunk_offsets = HashMap::<usize, u64>::new();
+    for (i, chunk) in delta.unmatched_chunks.iter().enumerate() {
+        chunk_offsets.insert(i, buflen);
+        buflen += chunk.len() as u64;
+    }
 
     out.write_all(HEADER)?;
     out.write_u64::<LittleEndian>(buflen)?;
@@ -215,31 +216,24 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
         ..Default::default()
     };
 
-    for e in delta
-        .matched
-        .into_iter()
-        .zip_longest(delta.unmatched.into_iter())
-    {
-        let e = e.map_left(|matched| {
+    for e in delta.matched.iter().zip_longest(delta.unmatched.iter()) {
+        let e = e.map_left(|(&start, chunk)| {
             (
-                matched.0,
+                start,
                 PatchEntry::CopySource {
-                    start: matched.1.start,
-                    len: matched.1.buf.len() as u64,
+                    start: chunk.start,
+                    len: chunk.buf.len() as u64,
                 },
             )
         });
-        let e = e.map_right(|unmatched| -> Result<_, anyhow::Error> {
-            let p = PatchEntry::CopyBuf {
-                start: buflen,
-                len: unmatched.1.buf.len() as u64,
-            };
-            out.write_all(unmatched.1.buf)?;
-            Ok((unmatched.0, p))
+        let e = e.map_right(|(&start, &bufidx)| {
+            let len = delta.unmatched_chunks[bufidx].len() as u64;
+            let &buf_start = chunk_offsets.get(&bufidx).unwrap();
+            let p = PatchEntry::CopyBuf { start: buf_start, len };
+            (start, p)
         });
         match e {
             EitherOrBoth::Both(matched, unmatched) => {
-                let unmatched = unmatched?;
                 if matched.0 < unmatched.0 {
                     patch.chunks.push(matched.1);
                     patch.chunks.push(unmatched.1);
@@ -251,11 +245,9 @@ pub(crate) fn create_patchfile<W: std::io::Write>(
             EitherOrBoth::Left(matched) => {
                 patch.chunks.push(matched.1);
             }
-            EitherOrBoth::Right(unmatched) => patch.chunks.push(unmatched?.1),
+            EitherOrBoth::Right(unmatched) => patch.chunks.push(unmatched.1),
         };
     }
-
-    assert_eq!(buf_offset, buflen);    
 
     bincode::serialize_into(out, &patch)?;
 
