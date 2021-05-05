@@ -6,9 +6,10 @@
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use coreos_stream_metadata::Artifact;
+use fn_error_context::context;
 use rayon::prelude::*;
-use std::fs::File;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use structopt::StructOpt;
 
@@ -17,10 +18,14 @@ mod utils;
 
 /// The target directory
 const DIR: &str = "coreos-images-dehydrated";
+/// Where we put temporarily decompressed images
+const CACHEDIR: &str = "dehydrate-cache";
+/// The name of our stream file
 const STREAM_FILE: &str = "stream.json";
-
 // Number of CPUs we'll use
 const N_WORKERS: u32 = 2;
+// The qemu name
+const QEMU: &str = "qemu";
 // openstack and ibmcloud are just qcow2 images.
 // gcp is a tarball with a sparse disk image inside it, but for rsync that's
 // not really different than a qcow2.
@@ -38,9 +43,7 @@ const RSYNC_STRATEGY_DISK: &[&str] = &["openstack", "ibmcloud", "gcp"];
 #[derive(Debug, StructOpt)]
 struct DehydrateOpts {
     //    #[structopt(long)]
-    //    artifact: Vec<String>,
-    #[structopt(long)]
-    skip_unavailable: bool,
+//    artifact: Vec<String>,
 }
 
 #[derive(Debug, StructOpt)]
@@ -66,19 +69,46 @@ struct RehydrateOpts {
     skip_validate: bool,
 }
 
+/// Commands used to dehydrate images
+#[derive(Debug, StructOpt)]
+#[structopt(rename_all = "kebab-case")]
+enum Build {
+    /// Initialize from a stream
+    Init {
+        /// Stream ID (e.g. `stable` for FCOS, `rhcos-4.8` for RHCOS)
+        stream: String,
+    },
+    /// Download all supported images
+    Download,
+    /// Generate "dehydration files"
+    Dehydrate(DehydrateOpts),
+}
+
 #[derive(Debug, StructOpt)]
 #[structopt(name = "coreos-diskimage-rehydrator")]
 #[structopt(rename_all = "kebab-case")]
 enum Opt {
-    /// Generate "dehydration files"
-    Dehydrate(DehydrateOpts),
+    PrintStreamJson,
+    Build(Build),
     /// Regenerate target file
     Rehydrate(RehydrateOpts),
 }
 
 fn run() -> Result<()> {
     match Opt::from_args() {
-        Opt::Dehydrate(ref opts) => dehydrate(opts),
+        Opt::PrintStreamJson => {
+            let srcdir = camino::Utf8Path::new(DIR);
+            let mut f = BufReader::new(File::open(srcdir.join("stream.json"))?);
+            let out = std::io::stdout();
+            let mut out = out.lock();
+            std::io::copy(&mut f, &mut out)?;
+            Ok(())
+        }
+        Opt::Build(b) => match b {
+            Build::Init { ref stream } => build_init(stream.as_str()),
+            Build::Download => build_download(),
+            Build::Dehydrate(ref opts) => build_dehydrate(opts),
+        },
         Opt::Rehydrate(ref opts) => rehydrate(opts),
     }
 }
@@ -153,8 +183,8 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     if opts.disk.len() > 0 {
         // Need to decompress the qemu image
         let qemu = s
-            .query_thisarch_single("qemu")
-            .ok_or_else(|| anyhow!("Missing qemu"))?;
+            .query_thisarch_single(QEMU)
+            .ok_or_else(|| anyhow!("Missing {}", QEMU))?;
         let qemu_fn = Utf8Path::new(uncompressed_name(filename_for_artifact(qemu)?));
         if !qemu_fn.exists() {
             {
@@ -174,7 +204,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
         }
         opts.disk
             .par_iter()
-            .filter(|s| s.as_str() != "qemu")
+            .filter(|s| s.as_str() != QEMU)
             .try_for_each(|disk| {
                 let a = s
                     .query_thisarch_single(disk)
@@ -185,7 +215,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 validate(opts, a, target_fn)?;
                 Ok::<_, anyhow::Error>(())
             })?;
-        if opts.disk.iter().find(|s| s.as_str() == "qemu").is_some() {
+        if opts.disk.iter().find(|s| s.as_str() == QEMU).is_some() {
             print!("Generated: {}", qemu_fn);
         }
     }
@@ -193,10 +223,12 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+fn maybe_uncompressed_name(s: &str) -> Option<&str> {
+    s.strip_suffix(".xz").or_else(|| s.strip_suffix(".gz"))
+}
+
 fn uncompressed_name(s: &str) -> &str {
-    s.strip_suffix(".xz")
-        .or_else(|| s.strip_suffix(".gz"))
-        .unwrap_or(s)
+    maybe_uncompressed_name(s).unwrap_or(s)
 }
 
 fn filename_for_artifact(a: &Artifact) -> Result<&str> {
@@ -233,26 +265,22 @@ fn rdelta_name_for_artifact(a: &Artifact) -> Result<String> {
     ))
 }
 
+#[context("Creating rsync delta")]
 fn rsync_delta(
-    opts: &DehydrateOpts,
+    _opts: &DehydrateOpts,
     src: &Artifact,
     target: &Artifact,
     destdir: impl AsRef<Utf8Path>,
 ) -> Result<bool> {
     let destdir = destdir.as_ref();
-    let target_fn = Utf8Path::new(uncompressed_name(filename_for_artifact(target)?));
-    if !target_fn.exists() {
-        if opts.skip_unavailable {
-            println!("Skipping: {}", target_fn);
-            return Ok(false);
-        }
-        return Err(anyhow!("Missing image: {}", target_fn));
-    }
-    let src_fn = Utf8Path::new(uncompressed_name(filename_for_artifact(src)?));
+
+    let src_fn = &get_maybe_uncompressed(src)?;
+    let target_fn = &get_maybe_uncompressed(target)?;
+
     let delta_path = &destdir.join(rdelta_name_for_artifact(target)?);
     let output = std::io::BufWriter::new(File::create(delta_path)?);
     // zstd encode the rsync delta because it saves space.
-    let mut output = zstd::Encoder::new(output, 10)?;
+    let mut output = zstd::Encoder::new(output, 7)?;
     rsync::prepare(src_fn, target_fn, destdir, &mut output)?;
     output.finish()?;
     let orig_size = target_fn.metadata()?.len();
@@ -266,22 +294,60 @@ fn rsync_delta(
     Ok(true)
 }
 
-/// Loop over stream metadata and generate dehydrated (~deduplicated) content.
-fn dehydrate(opts: &DehydrateOpts) -> Result<()> {
+fn read_stream() -> Result<coreos_stream_metadata::Stream> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = File::open(stream_path).context("Failed to open stream.json")?;
     let s: coreos_stream_metadata::Stream = serde_json::from_reader(std::io::BufReader::new(s))?;
+    Ok(s)
+}
+
+fn cached_uncompressed_name(a: &Artifact) -> Result<Option<Utf8PathBuf>> {
+    let name = filename_for_artifact(a)?;
+    Ok(maybe_uncompressed_name(name).map(|uncomp_name| Utf8Path::new(CACHEDIR).join(uncomp_name)))
+}
+
+fn uncompressor_for(name: &Utf8Path, src: impl Read) -> Result<impl Read> {
+    let r = match name.extension() {
+        Some("xz") => either::Left(xz2::read::XzDecoder::new(src)),
+        Some("gz") => either::Right(flate2::read::GzDecoder::new(src)),
+        Some(other) => return Err(anyhow!("Unknown extension {}", other)),
+        None => return Err(anyhow!("No extension found for {}", name)),
+    };
+    Ok(r)
+}
+
+fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
+    let name = Utf8Path::new(filename_for_artifact(a)?);
+    let uncomp_name = cached_uncompressed_name(a)?;
+    let r = uncomp_name
+        .map(|uncomp_name| {
+            if !uncomp_name.exists() {
+                let src = File::open(name).with_context(|| anyhow!("Failed to open {}", name))?;
+                let mut src = uncompressor_for(name, src)?;
+                let mut dest = std::io::BufWriter::new(File::create(&uncomp_name)?);
+                std::io::copy(&mut src, &mut dest)?;
+                println!("Uncompressed: {}", uncomp_name);
+            }
+            Ok::<_, anyhow::Error>(uncomp_name)
+        })
+        .transpose()?;
+    Ok(r.unwrap_or_else(|| name.into()))
+}
+
+/// Loop over stream metadata and generate dehydrated (~deduplicated) content.
+fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
+    let stream_path = Utf8Path::new(STREAM_FILE);
+    let s = read_stream()?;
+
+    std::fs::create_dir_all(CACHEDIR).context("Creating cachedir")?;
+
     let thisarch = s
         .this_architecture()
         .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
     let qemu = s
         .query_thisarch_single("qemu")
         .ok_or_else(|| anyhow!("Missing qemu image"))?;
-    let qemu_fn = filename_for_artifact(qemu)?;
-    let qemu_fn = Utf8Path::new(uncompressed_name(qemu_fn));
-    if !qemu_fn.exists() {
-        return Err(anyhow!("Missing uncompressed qemu image: {}", qemu_fn));
-    }
+    let uncomp_qemu = &get_maybe_uncompressed(qemu)?;
     let destdir = camino::Utf8Path::new(DIR);
     std::fs::create_dir(destdir)
         .with_context(|| anyhow!("Failed to create destination directory: {}", destdir))?;
@@ -311,8 +377,8 @@ fn dehydrate(opts: &DehydrateOpts) -> Result<()> {
     }
 
     // Link in the qemu image now, we'll compress it at the end
-    let qemu_dest = &destdir.join(qemu_fn);
-    hardlink(qemu_fn, qemu_dest)?;
+    let qemu_dest = &destdir.join(uncomp_qemu.file_name().unwrap());
+    hardlink(uncomp_qemu, qemu_dest)?;
 
     let qemu_rsyncable: Vec<&Artifact> = RSYNC_STRATEGY_DISK
         .par_iter()
@@ -353,4 +419,83 @@ mod tests {
     fn test_strip_suffix() {
         assert_eq!(uncompressed_name("foo.xz"), "foo");
     }
+}
+
+fn build_init(stream: &str) -> Result<()> {
+    let u = coreos_stream_metadata::stream_url_from_id(stream)?;
+    if Utf8Path::new(STREAM_FILE).exists() {
+        return Err(anyhow!("{} exists, not overwriting", STREAM_FILE));
+    }
+    println!("Downloading {}", u);
+    let mut out = std::io::BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(STREAM_FILE)?,
+    );
+    let mut resp = reqwest::blocking::get(&u)?;
+    resp.copy_to(&mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+fn build_download() -> Result<()> {
+    let s = read_stream()?;
+    let thisarch = s
+        .this_architecture()
+        .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
+    let client = reqwest::blocking::ClientBuilder::new()
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .https_only(true)
+        .build()?;
+    let artifacts = {
+        let mut artifacts = Vec::new();
+        for name in RSYNC_STRATEGY_DISK.iter().chain(std::iter::once(&QEMU)) {
+            let a = s
+                .query_thisarch_single(name)
+                .ok_or_else(|| anyhow!("Missing {}", name))?;
+            artifacts.push(a);
+        }
+        if let Some(metal) = thisarch.artifacts.get("metal") {
+            if let Some(pxe) = metal.formats.get("pxe") {
+                let rootfs = pxe
+                    .get("rootfs")
+                    .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
+                artifacts.push(rootfs)
+            }
+            // If we have an ISO, delta it from the rootfs
+            if let Some(iso) = metal.formats.get("iso") {
+                artifacts.push(iso.get("disk").ok_or_else(|| anyhow!("Invalid iso"))?);
+            }
+        }
+        artifacts
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(N_WORKERS as usize)
+        .build()
+        .unwrap();
+    pool.install(|| -> Result<_> {
+        artifacts.par_iter().try_for_each_init(
+            || client.clone(),
+            |client, &a| -> Result<()> {
+                let fname = Utf8Path::new(filename_for_artifact(a)?);
+                if fname.exists() {
+                    return Ok(());
+                }
+                let temp_name = &format!("{}.tmp", fname);
+                let mut out = std::io::BufWriter::new(File::create(temp_name)?);
+                let mut resp = client.get(a.location.as_str()).send()?;
+                resp.copy_to(&mut out)
+                    .with_context(|| anyhow!("Failed to download {}", a.location))?;
+                std::fs::rename(temp_name, fname)?;
+                println!("Downloaded: {}", fname);
+                Ok(())
+            },
+        )
+    })?;
+    Ok(())
 }

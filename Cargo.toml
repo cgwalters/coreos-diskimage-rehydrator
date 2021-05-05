@@ -13,6 +13,7 @@ bincode = "1.3.3"
 byteorder = "1.4.3"
 camino = "1.0.4"
 clap = "2.33.3"
+either = "1.6.1"
 indicatif = "0.16.0"
 serde = "1.0.111"
 serde_bytes = "0.11.5"
@@ -23,9 +24,13 @@ tempfile = "3.1.0"
 tracing = "0.1"
 tracing-subscriber = "0.2.17"
 zstd = "0.7.0"
-coreos-stream-metadata = { git = "https://github.com/cgwalters/stream-metadata-rust", rev = "c48ea32cf4418bd81c40f748a6c1ffe2f1e64030" }
+coreos-stream-metadata = { git = "https://github.com/cgwalters/stream-metadata-rust", rev = "f23ee489a965ad4cc37ff549a75945c24aa0356a" }
 nix = "0.20.0"
 rayon = "1.5.0"
+reqwest = { version = "0.11.3", "features" = ["blocking"] }
+xz2 = "0.1"
+flate2 = "^1.0"
+fn-error-context = "0.1.2"
 
 [profile.release]
 debug = true

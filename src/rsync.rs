@@ -1,6 +1,7 @@
 //use rayon::prelude::*;
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use fn_error_context::context;
 use serde_derive::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::fs::File;
@@ -36,6 +37,7 @@ fn setup_rsync_src(src: &Utf8Path, tempdir: &Utf8Path) -> Result<()> {
     Ok(())
 }
 
+#[context("Generating rsync delta")]
 pub(crate) fn prepare(
     src: &Utf8Path,
     dest: &Utf8Path,
@@ -50,7 +52,8 @@ pub(crate) fn prepare(
     setup_rsync_src(src, tempdir)?;
     let destdir = tempdir.join("new");
     std::fs::create_dir(&destdir)?;
-    std::fs::hard_link(dest, destdir.join(src_filename)).with_context(|| format!("Creating dest hardlink from {}", src_filename))?;
+    std::fs::hard_link(dest, destdir.join(src_filename))
+        .with_context(|| format!("Creating dest hardlink from {}", dest))?;
     let out: Utf8PathBuf = tempdir.join("d");
     println!("Preparing delta: {} -> {}", src, dest);
     let status = Command::new("rsync")
@@ -71,6 +74,7 @@ pub(crate) fn prepare(
     Ok(())
 }
 
+#[context("Applying rsync delta")]
 pub(crate) fn apply(
     src: &Utf8Path,
     dest_filename: &str,
@@ -114,4 +118,50 @@ pub(crate) fn apply(
     std::fs::rename(&temp_dest, dest_filename)
         .with_context(|| anyhow!("Renaming {}", temp_dest))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use byteorder::ReadBytesExt;
+    use std::io::Seek;
+
+    #[test]
+    fn test_rsync_delta() -> Result<()> {
+        let td = tempfile::tempdir()?;
+        let td: &Utf8Path = td.path().try_into()?;
+        let src = &td.join("sh.pristine");
+        std::fs::copy("/usr/bin/sh", src)?;
+        let dest = &td.join("sh");
+        std::fs::copy(src, dest)?;
+        let l = dest.metadata()?.len();
+        // Replace a byte in the file
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(dest)?;
+            f.seek(std::io::SeekFrom::Start(l / 3))?;
+            let b = f.read_u8()?;
+            let nb = b.wrapping_add(1);
+            f.write_all(&[nb])?;
+        }
+        let patch = {
+            let patch = td.join("rdelta");
+            let out = File::create(&patch)?;
+            let mut out = zstd::Encoder::new(out, 7)?;
+            super::prepare(src, dest, td, &mut out)?;
+            out.finish()?;
+            patch
+        };
+        let orig_dest = format!("{}.orig", dest);
+        std::fs::rename(dest, orig_dest).context("Renaming dest to .orig")?;
+
+        super::apply(src, dest.as_str(), td, &patch)?;
+        let s = Command::new("cmp").args(&[src, dest]).status()?;
+        if !s.success() {
+            return Err(anyhow!("cmp failed: {:?}", s));
+        }
+        Ok(())
+    }
 }
