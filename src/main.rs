@@ -13,6 +13,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use structopt::StructOpt;
+use tracing::{debug, info};
 
 mod qemu_img;
 mod rsync;
@@ -130,7 +131,7 @@ fn build_clean() -> Result<()> {
     let cachedir = Utf8Path::new(CACHEDIR);
     if cachedir.exists() {
         std::fs::remove_dir_all(cachedir)?;
-        println!("Removed: {}", CACHEDIR);
+        info!("Removed: {}", CACHEDIR);
     }
     Ok(())
 }
@@ -138,7 +139,7 @@ fn build_clean() -> Result<()> {
 fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) -> Result<()> {
     let target = target.as_ref();
     if opts.skip_validate {
-        println!("Generated (but skipped SHA-256 validation): {}", target);
+        info!("Generated (but skipped SHA-256 validation): {}", target);
         return Ok(());
     }
     let expected = a
@@ -154,7 +155,8 @@ fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) ->
             actual
         ));
     }
-    println!("Generated: {}", target);
+    debug!("Validated {}", expected);
+    info!("Generated: {}", target);
     Ok(())
 }
 
@@ -212,7 +214,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
             {
                 let qemu_zstd_path =
                     srcdir.join(format!("{}.zst", uncompressed_name(qemu_fn.as_str())));
-                println!("Decompressing: {}", qemu_zstd_path);
+                info!("Decompressing: {}", qemu_zstd_path);
                 let f = File::open(&qemu_zstd_path)
                     .with_context(|| anyhow!("Opening {}", qemu_zstd_path))?;
                 let mut f = zstd::Decoder::new(f)?;
@@ -238,10 +240,10 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 let tmpname = &Utf8PathBuf::from(format!("{}.tmp", uncompressed_name));
                 rsync::apply(qemu_fn, tmpname.as_str(), Utf8Path::new("."), patch)?;
                 if uncompressed_name.extension() == Some(qemu_img::VMDK) {
-                    println!("Regenerating VMDK for: {}", disk); // 😢
+                    info!("Regenerating VMDK for: {}", disk); // 😢
                     qemu_img::copy_to_vmdk(tmpname, uncompressed_name)?;
                     std::fs::remove_file(tmpname)?;
-                    println!(
+                    info!(
                         "Generated (but skipped SHA-256 validation due to vmdk compression): {}",
                         uncompressed_name
                     );
@@ -276,7 +278,7 @@ fn filename_for_artifact(a: &Artifact) -> Result<&str> {
 fn hardlink(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result<()> {
     let src = src.as_ref();
     let dest = dest.as_ref();
-    println!("Including: {:?}", src);
+    info!("Including: {:?}", src);
     std::fs::hard_link(src, dest).with_context(|| anyhow!("Hardlinking {:?}", src))?;
     Ok(())
 }
@@ -316,7 +318,7 @@ fn rsync_delta(src: &Artifact, target: &Artifact, destdir: impl AsRef<Utf8Path>)
     output.finish()?;
     let orig_size = target_fn.metadata()?.len();
     let delta_size = delta_path.metadata()?.len();
-    println!(
+    info!(
         "Dehydrated: {} ({:.5}%, {})",
         target_fn,
         ((delta_size as f64 / orig_size as f64) * 100f64),
@@ -371,11 +373,11 @@ fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
                 if is_vmdk {
                     qemu_img::copy_to_qcow2(&tmpname, &uncomp_name)?;
                     std::fs::remove_file(tmpname)?;
-                    println!("Converted to uncompressed qcow2: {}", name);
+                    info!("Converted to uncompressed qcow2: {}", name);
                 } else {
                     std::fs::rename(&tmpname, &uncomp_name)?;
                 }
-                println!("Uncompressed: {}", uncomp_name);
+                info!("Uncompressed: {}", uncomp_name);
             }
             Ok::<_, anyhow::Error>(uncomp_name)
         })
@@ -453,16 +455,30 @@ fn build_dehydrate() -> Result<()> {
         Ok::<_, anyhow::Error>(())
     })?;
 
-    println!("Including (zstd compressed): {}", qemu_dest);
+    info!("Including (zstd compressed): {}", qemu_dest);
     zstd_compress(qemu_dest)?;
 
     Ok(())
 }
 
 fn main() {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{fmt, EnvFilter};
+
+    // We need to write to stderr by default because a primary
+    // use case is to output images to stdout.
+    let fmt_layer = fmt::layer().with_writer(std::io::stderr);
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
+                .or_else(|_| EnvFilter::try_new("info"))
+                .unwrap(),
+        )
+        .with(fmt_layer)
+        .init();
     // Print the error
     if let Err(e) = run() {
-        eprintln!("{:#}", e);
+        tracing::error!("{:#}", e);
         std::process::exit(1)
     }
 }
@@ -482,7 +498,7 @@ fn build_init(stream: &str) -> Result<()> {
     if Utf8Path::new(STREAM_FILE).exists() {
         return Err(anyhow!("{} exists, not overwriting", STREAM_FILE));
     }
-    println!("Downloading {}", u);
+    info!("Downloading {}", u);
     let mut out = std::io::BufWriter::new(
         OpenOptions::new()
             .write(true)
@@ -548,7 +564,7 @@ fn build_download() -> Result<()> {
                 resp.copy_to(&mut out)
                     .with_context(|| anyhow!("Failed to download {}", a.location))?;
                 std::fs::rename(temp_name, fname)?;
-                println!("Downloaded: {}", fname);
+                info!("Downloaded: {}", fname);
                 Ok(())
             },
         )
@@ -565,7 +581,7 @@ fn build_download() -> Result<()> {
             },
         )
         .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
-    println!(
+    info!(
         "Original artifact total size: {}",
         indicatif::HumanBytes(size)
     );

@@ -7,6 +7,7 @@ use std::convert::TryInto;
 use std::fs::File;
 use std::io::Write;
 use std::process::{Command, Stdio};
+use tracing::info;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct RollsumDeltaHeader {
@@ -55,7 +56,7 @@ pub(crate) fn prepare(
     std::fs::hard_link(dest, destdir.join(src_filename))
         .with_context(|| format!("Creating dest hardlink from {}", dest))?;
     let out: Utf8PathBuf = tempdir.join("d");
-    println!("Preparing delta: {} -> {}", src, dest);
+    info!("Preparing delta: {} -> {}", src, dest);
     let status = Command::new("rsync")
         .args(&["-rl"])
         .arg(format!("--only-write-batch={}", out.as_str()))
@@ -103,7 +104,7 @@ pub(crate) fn apply(
     std::fs::create_dir(&destdir)?;
     std::fs::hard_link(src, &temp_dest).context("Creating dest hardlink")?;
 
-    println!("Rehydrating: {} -> {}", src, dest_filename);
+    info!("Rehydrating: {} -> {}", src, dest_filename);
     let status = Command::new("rsync")
         .args(&["-rl"])
         .arg(format!("--read-batch={}", patch))
