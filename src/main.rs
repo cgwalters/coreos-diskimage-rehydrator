@@ -5,7 +5,8 @@
 
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
-use coreos_stream_metadata::Artifact;
+use coreos_stream_metadata::Stream as CoreStream;
+use coreos_stream_metadata::{Artifact, Stream};
 use fn_error_context::context;
 use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
@@ -13,6 +14,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use structopt::StructOpt;
 
+mod qemu_img;
 mod rsync;
 mod utils;
 
@@ -22,10 +24,12 @@ const DIR: &str = "coreos-images-dehydrated";
 const CACHEDIR: &str = "dehydrate-cache";
 /// The name of our stream file
 const STREAM_FILE: &str = "stream.json";
-// Number of CPUs we'll use
+/// Number of CPUs we'll use
 const N_WORKERS: u32 = 2;
-// The qemu name
+/// The qemu name
 const QEMU: &str = "qemu";
+/// AWS is vmdk so handled specially
+const AWS: &str = "aws";
 // openstack and ibmcloud are just qcow2 images.
 // gcp is a tarball with a sparse disk image inside it, but for rsync that's
 // not really different than a qcow2.
@@ -144,7 +148,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     let srcdir = camino::Utf8Path::new(DIR);
     let stream_path = &srcdir.join(STREAM_FILE);
     let s = File::open(stream_path).context("Failed to open stream.json")?;
-    let s: coreos_stream_metadata::Stream = serde_json::from_reader(std::io::BufReader::new(s))?;
+    let s: CoreStream = serde_json::from_reader(std::io::BufReader::new(s))?;
     let thisarch = s
         .this_architecture()
         .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
@@ -209,10 +213,24 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 let a = s
                     .query_thisarch_single(disk)
                     .ok_or_else(|| anyhow!("Failed to find disk for {}", disk))?;
+                let artifact_filename = Utf8Path::new(filename_for_artifact(a)?);
+                let uncompressed_name =
+                    Utf8Path::new(uncompressed_name(artifact_filename.as_str()));
                 let patch = srcdir.join(rdelta_name_for_artifact(a)?);
-                let target_fn = uncompressed_name(filename_for_artifact(a)?);
-                rsync::apply(qemu_fn, target_fn, Utf8Path::new("."), patch)?;
-                validate(opts, a, target_fn)?;
+                let tmpname = &Utf8PathBuf::from(format!("{}.tmp", uncompressed_name));
+                rsync::apply(qemu_fn, tmpname.as_str(), Utf8Path::new("."), patch)?;
+                if uncompressed_name.extension() == Some(qemu_img::VMDK) {
+                    println!("Regenerating VMDK for: {}", disk); // 😢
+                    qemu_img::copy_to_vmdk(tmpname, uncompressed_name)?;
+                    std::fs::remove_file(tmpname)?;
+                    println!(
+                        "Generated (but skipped SHA-256 validation due to vmdk compression): {}",
+                        uncompressed_name
+                    );
+                } else {
+                    std::fs::rename(tmpname, uncompressed_name)?;
+                    validate(opts, a, uncompressed_name)?;
+                }
                 Ok::<_, anyhow::Error>(())
             })?;
         if opts.disk.iter().find(|s| s.as_str() == QEMU).is_some() {
@@ -294,16 +312,25 @@ fn rsync_delta(
     Ok(true)
 }
 
-fn read_stream() -> Result<coreos_stream_metadata::Stream> {
+fn read_stream() -> Result<CoreStream> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = File::open(stream_path).context("Failed to open stream.json")?;
-    let s: coreos_stream_metadata::Stream = serde_json::from_reader(std::io::BufReader::new(s))?;
+    let s: CoreStream = serde_json::from_reader(std::io::BufReader::new(s))?;
     Ok(s)
 }
 
-fn cached_uncompressed_name(a: &Artifact) -> Result<Option<Utf8PathBuf>> {
+fn cached_uncompressed_name(a: &Artifact) -> Result<Option<(Utf8PathBuf, bool)>> {
     let name = filename_for_artifact(a)?;
-    Ok(maybe_uncompressed_name(name).map(|uncomp_name| Utf8Path::new(CACHEDIR).join(uncomp_name)))
+    let r = maybe_uncompressed_name(name)
+        .map(|uncomp_name| Utf8Path::new(CACHEDIR).join(uncomp_name))
+        .map(|p| {
+            if p.extension() == Some(qemu_img::VMDK) {
+                (p.with_extension(qemu_img::QCOW2), true)
+            } else {
+                (p, false)
+            }
+        });
+    Ok(r)
 }
 
 fn uncompressor_for(name: &Utf8Path, src: impl Read) -> Result<impl Read> {
@@ -320,18 +347,42 @@ fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
     let name = Utf8Path::new(filename_for_artifact(a)?);
     let uncomp_name = cached_uncompressed_name(a)?;
     let r = uncomp_name
-        .map(|uncomp_name| {
+        .map(|(uncomp_name, is_vmdk)| {
             if !uncomp_name.exists() {
                 let src = File::open(name).with_context(|| anyhow!("Failed to open {}", name))?;
+                let tmpname = format!("{}.tmp", uncomp_name);
                 let mut src = uncompressor_for(name, src)?;
-                let mut dest = std::io::BufWriter::new(File::create(&uncomp_name)?);
+                let mut dest = std::io::BufWriter::new(File::create(&tmpname)?);
                 std::io::copy(&mut src, &mut dest)?;
+                dest.flush()?;
+                if is_vmdk {
+                    qemu_img::copy_to_qcow2(&tmpname, &uncomp_name)?;
+                    std::fs::remove_file(tmpname)?;
+                    println!("Converted to uncompressed qcow2: {}", name);
+                } else {
+                    std::fs::rename(&tmpname, &uncomp_name)?;
+                }
                 println!("Uncompressed: {}", uncomp_name);
             }
             Ok::<_, anyhow::Error>(uncomp_name)
         })
         .transpose()?;
     Ok(r.unwrap_or_else(|| name.into()))
+}
+
+// Generate an image from its rsync delta.
+fn dehydrate_rsyncable(
+    opts: &DehydrateOpts,
+    s: &Stream,
+    qemu: &Artifact,
+    name: &str,
+    destdir: &Utf8Path,
+) -> Result<()> {
+    let a = s
+        .query_thisarch_single(name)
+        .ok_or_else(|| anyhow!("Missing artifact {}", name))?;
+    let _found: bool = rsync_delta(opts, qemu, a, destdir)?;
+    Ok(())
 }
 
 /// Loop over stream metadata and generate dehydrated (~deduplicated) content.
@@ -380,21 +431,22 @@ fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
     let qemu_dest = &destdir.join(uncomp_qemu.file_name().unwrap());
     hardlink(uncomp_qemu, qemu_dest)?;
 
-    let qemu_rsyncable: Vec<&Artifact> = RSYNC_STRATEGY_DISK
-        .par_iter()
-        .filter_map(|a| s.query_thisarch_single(a))
-        .collect();
-
     // Add some parallelism
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(N_WORKERS as usize)
         .build()
         .unwrap();
-    pool.install(|| -> Result<_> {
-        qemu_rsyncable.par_iter().try_for_each(|a| {
-            let _found: bool = rsync_delta(opts, qemu, a, destdir)?;
-            Ok(())
-        })
+    pool.install(|| {
+        // The rsyncable artifacts are easy.
+        RSYNC_STRATEGY_DISK
+            .par_iter()
+            .map(|&name| dehydrate_rsyncable(opts, &s, qemu, name, destdir))
+            .chain(
+                rayon::iter::once(AWS)
+                    .map(|name| dehydrate_rsyncable(opts, &s, qemu, name, destdir)),
+            )
+            .try_reduce(|| (), |_, _| Ok(()))?;
+        Ok::<_, anyhow::Error>(())
     })?;
 
     println!("Including (zstd compressed): {}", qemu_dest);
