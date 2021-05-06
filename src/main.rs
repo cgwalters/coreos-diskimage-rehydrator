@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tracing::{debug, info};
 
@@ -66,6 +67,12 @@ struct RehydrateOpts {
     /// Don't verify SHA-256 of generated images
     #[structopt(long)]
     skip_validate: bool,
+
+    /// Output image(s) to stdout; if multiple images are specified,
+    /// the output will be `tar` format that can be extracted by
+    /// piping to e.g. `tar xf -`.
+    #[structopt(long)]
+    to_stdout: bool,
 }
 
 /// Commands used to dehydrate images
@@ -136,11 +143,46 @@ fn build_clean() -> Result<()> {
     Ok(())
 }
 
-fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) -> Result<()> {
+enum OutputTarget<W: std::io::Write> {
+    Stdout(W),
+    Tar(tar::Builder<W>),
+}
+
+struct RehydrateContext<'a, W: std::io::Write> {
+    opts: &'a RehydrateOpts,
+
+    target: Arc<Mutex<OutputTarget<W>>>,
+}
+
+fn write_output<W: std::io::Write>(
+    ctx: &RehydrateContext<W>,
+    target: impl AsRef<Utf8Path>,
+) -> Result<()> {
     let target = target.as_ref();
-    if opts.skip_validate {
+    let mut outtarget = ctx.target.lock().unwrap();
+    match &mut *outtarget {
+        OutputTarget::Stdout(ref mut s) => {
+            let mut src = std::io::BufReader::new(File::open(target)?);
+            std::io::copy(&mut src, s)?;
+            Ok(())
+        }
+        OutputTarget::Tar(ref mut t) => {
+            let mut src = File::open(target)?;
+            t.append_file(target.file_name().unwrap(), &mut src)?;
+            Ok(())
+        }
+    }
+}
+
+fn finish_output<W: std::io::Write>(
+    ctx: &RehydrateContext<W>,
+    a: &Artifact,
+    target: impl AsRef<Utf8Path>,
+) -> Result<()> {
+    let target = target.as_ref();
+    if ctx.opts.skip_validate {
         info!("Generated (but skipped SHA-256 validation): {}", target);
-        return Ok(());
+        return write_output(ctx, target);
     }
     let expected = a
         .uncompressed_sha256
@@ -157,13 +199,30 @@ fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) ->
     }
     debug!("Validated {}", expected);
     info!("Generated: {}", target);
-    Ok(())
+    write_output(ctx, target)
 }
 
 fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     if opts.disk.is_empty() && !opts.iso {
         return Err(anyhow!("No images specified"));
     }
+
+    let have_multiple = (opts.iso && !opts.disk.is_empty()) || opts.disk.len() > 1;
+    let stdout = std::io::stdout();
+
+    let target = if have_multiple {
+        OutputTarget::Tar(tar::Builder::new(stdout))
+    } else {
+        if nix::unistd::isatty(1)? {
+            return Err(anyhow!("Refusing to output to a tty"));
+        }
+        OutputTarget::Stdout(stdout)
+    };
+
+    let ctx = &RehydrateContext {
+        opts,
+        target: Arc::new(Mutex::new(target)),
+    };
 
     let srcdir = camino::Utf8Path::new(DIR);
     let stream_path = &srcdir.join(STREAM_FILE);
@@ -197,7 +256,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
             Utf8Path::new("."),
             patch,
         )?;
-        validate(opts, iso, iso_fn)?;
+        finish_output(ctx, iso, iso_fn)?;
     }
 
     if opts.pxe {
@@ -224,7 +283,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 std::io::copy(&mut f, &mut o).context("Failed to decompress qemu")?;
                 o.flush()?;
             }
-            validate(opts, qemu, qemu_fn)?;
+            info!("Unpacked source image: {}", qemu_fn);
         }
         opts.disk
             .par_iter()
@@ -249,12 +308,22 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                     );
                 } else {
                     std::fs::rename(tmpname, uncompressed_name)?;
-                    validate(opts, a, uncompressed_name)?;
+                    finish_output(ctx, a, uncompressed_name)?;
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
         if opts.disk.iter().any(|s| s.as_str() == QEMU) {
             print!("Generated: {}", qemu_fn);
+        }
+    }
+
+    let mut target = ctx.target.lock().unwrap();
+    match &mut *target {
+        OutputTarget::Stdout(s) => {
+            s.flush()?;
+        }
+        OutputTarget::Tar(t) => {
+            t.finish()?;
         }
     }
 
