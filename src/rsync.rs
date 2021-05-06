@@ -43,7 +43,7 @@ pub(crate) fn prepare(
     src: &Utf8Path,
     dest: &Utf8Path,
     tempdir: &Utf8Path,
-    mut patch: impl Write,
+    patch: impl Write,
 ) -> Result<()> {
     let tempdir = tempfile::tempdir_in(tempdir).context("Creating tempdir")?;
     let tempdir: &Utf8Path = tempdir.path().try_into()?;
@@ -71,7 +71,10 @@ pub(crate) fn prepare(
 
     let batchf = File::open(&out).with_context(|| format!("Reading delta file {}", out))?;
     let mut batchf = std::io::BufReader::new(batchf);
+    // zstd encode the rsync delta because it saves space.
+    let mut patch = zstd::Encoder::new(patch, 7)?;
     std::io::copy(&mut batchf, &mut patch)?;
+    patch.finish()?;
     Ok(())
 }
 
@@ -149,10 +152,9 @@ mod tests {
         }
         let patch = {
             let patch = td.join("rdelta");
-            let out = File::create(&patch)?;
-            let mut out = zstd::Encoder::new(out, 7)?;
+            let mut out = File::create(&patch)?;
             super::prepare(src, dest, td, &mut out)?;
-            out.finish()?;
+            out.flush()?;
             patch
         };
         let orig_dest = format!("{}.orig", dest);

@@ -380,11 +380,9 @@ fn rsync_delta(src: &Artifact, target: &Artifact, destdir: impl AsRef<Utf8Path>)
     let target_fn = &get_maybe_uncompressed(target)?;
 
     let delta_path = &destdir.join(rdelta_name_for_artifact(target)?);
-    let output = std::io::BufWriter::new(File::create(delta_path)?);
-    // zstd encode the rsync delta because it saves space.
-    let mut output = zstd::Encoder::new(output, 7)?;
+    let mut output = std::io::BufWriter::new(File::create(delta_path)?);
     rsync::prepare(src_fn, target_fn, destdir, &mut output)?;
-    output.finish()?;
+    output.flush()?;
     let orig_size = target_fn.metadata()?.len();
     let delta_size = delta_path.metadata()?.len();
     info!(
