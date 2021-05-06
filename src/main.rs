@@ -45,12 +45,6 @@ const RSYNC_STRATEGY_DISK: &[&str] = &["openstack", "ibmcloud", "gcp"];
 // concatenate the two.
 
 #[derive(Debug, StructOpt)]
-struct DehydrateOpts {
-    //    #[structopt(long)]
-//    artifact: Vec<String>,
-}
-
-#[derive(Debug, StructOpt)]
 struct RehydrateOpts {
     /// Extract the disk image for a specific platform
     #[structopt(long)]
@@ -84,8 +78,15 @@ enum Build {
     },
     /// Download all supported images
     Download,
-    /// Generate "dehydration files"
-    Dehydrate(DehydrateOpts),
+    /// Generate "dehydration files" from already downloaded files
+    Dehydrate,
+    /// Remove cached files
+    Clean,
+    /// Initialize, download, and dehydrate in one go
+    Run {
+        /// Stream ID (e.g. `stable` for FCOS, `rhcos-4.8` for RHCOS)
+        stream: String,
+    },
 }
 
 #[derive(Debug, StructOpt)]
@@ -111,10 +112,27 @@ fn run() -> Result<()> {
         Opt::Build(b) => match b {
             Build::Init { ref stream } => build_init(stream.as_str()),
             Build::Download => build_download(),
-            Build::Dehydrate(ref opts) => build_dehydrate(opts),
+            Build::Dehydrate => build_dehydrate(),
+            Build::Clean => build_clean(),
+            Build::Run { ref stream } => {
+                build_init(stream.as_str())?;
+                build_download()?;
+                build_dehydrate()?;
+                build_clean()?;
+                Ok(())
+            }
         },
         Opt::Rehydrate(ref opts) => rehydrate(opts),
     }
+}
+
+fn build_clean() -> Result<()> {
+    let cachedir = Utf8Path::new(CACHEDIR);
+    if cachedir.exists() {
+        std::fs::remove_dir_all(cachedir)?;
+        println!("Removed: {}", CACHEDIR);
+    }
+    Ok(())
 }
 
 fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) -> Result<()> {
@@ -284,12 +302,7 @@ fn rdelta_name_for_artifact(a: &Artifact) -> Result<String> {
 }
 
 #[context("Creating rsync delta")]
-fn rsync_delta(
-    _opts: &DehydrateOpts,
-    src: &Artifact,
-    target: &Artifact,
-    destdir: impl AsRef<Utf8Path>,
-) -> Result<bool> {
+fn rsync_delta(src: &Artifact, target: &Artifact, destdir: impl AsRef<Utf8Path>) -> Result<bool> {
     let destdir = destdir.as_ref();
 
     let src_fn = &get_maybe_uncompressed(src)?;
@@ -371,22 +384,16 @@ fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
 }
 
 // Generate an image from its rsync delta.
-fn dehydrate_rsyncable(
-    opts: &DehydrateOpts,
-    s: &Stream,
-    qemu: &Artifact,
-    name: &str,
-    destdir: &Utf8Path,
-) -> Result<()> {
+fn dehydrate_rsyncable(s: &Stream, qemu: &Artifact, name: &str, destdir: &Utf8Path) -> Result<()> {
     let a = s
         .query_thisarch_single(name)
         .ok_or_else(|| anyhow!("Missing artifact {}", name))?;
-    let _found: bool = rsync_delta(opts, qemu, a, destdir)?;
+    let _found: bool = rsync_delta(qemu, a, destdir)?;
     Ok(())
 }
 
 /// Loop over stream metadata and generate dehydrated (~deduplicated) content.
-fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
+fn build_dehydrate() -> Result<()> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = read_stream()?;
 
@@ -423,7 +430,7 @@ fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
                 .get("disk")
                 .ok_or_else(|| anyhow!("Missing disk for metal/iso"))?;
             let rootfs = rootfs.ok_or_else(|| anyhow!("Found iso without pxe/rootfs"))?;
-            let _found: bool = rsync_delta(opts, rootfs, iso, destdir)?;
+            let _found: bool = rsync_delta(rootfs, iso, destdir)?;
         }
     }
 
@@ -440,11 +447,8 @@ fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
         // The rsyncable artifacts are easy.
         RSYNC_STRATEGY_DISK
             .par_iter()
-            .map(|&name| dehydrate_rsyncable(opts, &s, qemu, name, destdir))
-            .chain(
-                rayon::iter::once(AWS)
-                    .map(|name| dehydrate_rsyncable(opts, &s, qemu, name, destdir)),
-            )
+            .map(|&name| dehydrate_rsyncable(&s, qemu, name, destdir))
+            .chain(rayon::iter::once(AWS).map(|name| dehydrate_rsyncable(&s, qemu, name, destdir)))
             .try_reduce(|| (), |_, _| Ok(()))?;
         Ok::<_, anyhow::Error>(())
     })?;
@@ -506,7 +510,7 @@ fn build_download() -> Result<()> {
         .build()?;
     let artifacts = {
         let mut artifacts = Vec::new();
-        for name in RSYNC_STRATEGY_DISK.iter().chain(std::iter::once(&QEMU)) {
+        for name in RSYNC_STRATEGY_DISK.iter().chain([QEMU, AWS].iter()) {
             let a = s
                 .query_thisarch_single(name)
                 .ok_or_else(|| anyhow!("Missing {}", name))?;
@@ -549,5 +553,21 @@ fn build_download() -> Result<()> {
             },
         )
     })?;
+    let size: u64 = artifacts
+        .par_iter()
+        .try_fold(
+            || 0u64,
+            |acc, &artifact| {
+                let artifact_size = Utf8Path::new(filename_for_artifact(artifact)?)
+                    .metadata()?
+                    .len();
+                Ok::<_, anyhow::Error>(acc + artifact_size)
+            },
+        )
+        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+    println!(
+        "Original artifact total size: {}",
+        indicatif::HumanBytes(size)
+    );
     Ok(())
 }

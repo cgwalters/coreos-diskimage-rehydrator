@@ -10,6 +10,30 @@ The basic idea here is: Ship a container image that contains:
    the `-qemu.qcow2` and the `-aws.vmdk` disk images, the `.iso` etc - but without
    duplicating all the disk image data entirely as that would add up *fast*.
 
+## Try it now!
+
+An image is uploaded to `quay.io/cgwalters/fcos-images:stable`.  For example here
+we extract the OpenStack image:
+
+```
+$ podman run --rm -ti --entrypoint bash -v .:/out quay.io/cgwalters/fcos-images:stable 
+# coreos-diskimage-rehydrator rehydrate --disk openstack
+# mv fedora-coreos-33.20210426.3.0-openstack.x86_64.qcow2 /out/
+# exit
+```
+
+And now you have a `fedora-coreos-33.20210426.3.0-openstack.x86_64.qcow2` that you can e.g. upload
+with `glance`.
+
+There's more artifacts, for example use `--iso` to get the `metal` live ISO.
+
+As of right now, the original (compressed) images total `4.55GiB`, and the container image is `1.63GiB`,
+so a savings of `64%` which isn't bad.  But there's more we can do here - see the issues list for details
+on ideas.
+
+We also aren't including all the images; e.g. `vmware` is doable but needs some `ova` handling.
+The more images we include here, the better the overall compression ratio will look.
+
 # Requirement: Bit-for-bit uncompressed SHA-256 match
 
 Our CI tests the disk images.  In order to ensure that we're
