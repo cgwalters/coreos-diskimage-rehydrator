@@ -13,6 +13,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::Path;
 use structopt::StructOpt;
 
+mod qemu_img;
 mod rsync;
 mod utils;
 
@@ -22,10 +23,12 @@ const DIR: &str = "coreos-images-dehydrated";
 const CACHEDIR: &str = "dehydrate-cache";
 /// The name of our stream file
 const STREAM_FILE: &str = "stream.json";
-// Number of CPUs we'll use
+/// Number of CPUs we'll use
 const N_WORKERS: u32 = 2;
-// The qemu name
+/// The qemu name
 const QEMU: &str = "qemu";
+/// AWS is vmdk so handled specially
+const AWS: &str = "aws";
 // openstack and ibmcloud are just qcow2 images.
 // gcp is a tarball with a sparse disk image inside it, but for rsync that's
 // not really different than a qcow2.
@@ -380,21 +383,31 @@ fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
     let qemu_dest = &destdir.join(uncomp_qemu.file_name().unwrap());
     hardlink(uncomp_qemu, qemu_dest)?;
 
-    let qemu_rsyncable: Vec<&Artifact> = RSYNC_STRATEGY_DISK
-        .par_iter()
-        .filter_map(|a| s.query_thisarch_single(a))
-        .collect();
-
     // Add some parallelism
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(N_WORKERS as usize)
         .build()
         .unwrap();
-    pool.install(|| -> Result<_> {
-        qemu_rsyncable.par_iter().try_for_each(|a| {
+    pool.install(|| {
+        // The rsyncable artifacts are easy.
+        let rsyncable = RSYNC_STRATEGY_DISK.par_iter().map(|&name| {
+            let a = s
+                .query_thisarch_single(name)
+                .ok_or_else(|| anyhow!("Missing artifact {}", name))?;
             let _found: bool = rsync_delta(opts, qemu, a, destdir)?;
-            Ok(())
-        })
+            Ok::<_, anyhow::Error>(())
+        });
+        // AWS is a VMDK
+        let aws = rayon::iter::once(AWS).map(|name| {
+            let a = s
+                .query_thisarch_single(name)
+                .ok_or_else(|| anyhow!("Missing artifact {}", name))?;
+            // First uncompress
+
+            Ok::<_, anyhow::Error>(())
+        });
+        rsyncable.chain(aws).try_reduce(|| (), |_, _| Ok(()))?;
+        Ok::<_, anyhow::Error>(())
     })?;
 
     println!("Including (zstd compressed): {}", qemu_dest);
