@@ -17,6 +17,7 @@ use structopt::StructOpt;
 mod qemu_img;
 mod rsync;
 mod utils;
+mod ova;
 
 /// The target directory
 const DIR: &str = "coreos-images-dehydrated";
@@ -30,6 +31,8 @@ const N_WORKERS: u32 = 2;
 const QEMU: &str = "qemu";
 /// AWS is vmdk so handled specially
 const AWS: &str = "aws";
+/// vmware is ova so handled specially
+const VMWARE: &str = "vmware";
 // openstack and ibmcloud are just qcow2 images.
 // gcp is a tarball with a sparse disk image inside it, but for rsync that's
 // not really different than a qcow2.
