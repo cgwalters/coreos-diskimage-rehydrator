@@ -126,7 +126,7 @@ fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) ->
     let expected = a
         .uncompressed_sha256
         .as_deref()
-        .unwrap_or(a.sha256.as_str());
+        .unwrap_or_else(|| a.sha256.as_str());
     let actual = utils::sha256_file(target)?;
     if expected != actual {
         return Err(anyhow!(
@@ -141,7 +141,7 @@ fn validate(opts: &RehydrateOpts, a: &Artifact, target: impl AsRef<Utf8Path>) ->
 }
 
 fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
-    if opts.disk.len() == 0 && !opts.iso {
+    if opts.disk.is_empty() && !opts.iso {
         return Err(anyhow!("No images specified"));
     }
 
@@ -184,7 +184,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
         todo!()
     }
 
-    if opts.disk.len() > 0 {
+    if !opts.disk.is_empty() {
         // Need to decompress the qemu image
         let qemu = s
             .query_thisarch_single(QEMU)
@@ -233,7 +233,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
-        if opts.disk.iter().find(|s| s.as_str() == QEMU).is_some() {
+        if opts.disk.iter().any(|s| s.as_str() == QEMU) {
             print!("Generated: {}", qemu_fn);
         }
     }
