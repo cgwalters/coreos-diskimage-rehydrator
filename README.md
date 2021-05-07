@@ -16,16 +16,20 @@ An image is uploaded to `quay.io/cgwalters/fcos-images:stable`.  For example her
 we extract the OpenStack image:
 
 ```
-$ podman run --rm -ti --entrypoint bash -v .:/out quay.io/cgwalters/fcos-images:stable 
-# coreos-diskimage-rehydrator rehydrate --disk openstack
-# mv fedora-coreos-33.20210426.3.0-openstack.x86_64.qcow2 /out/
-# exit
+$ podman run --rm -i quay.io/cgwalters/fcos-images:stable rehydrate --to-stdout --disk openstack > fedora-coreos-openstack.x86_64.qcow2
 ```
 
-And now you have a `fedora-coreos-33.20210426.3.0-openstack.x86_64.qcow2` that you can e.g. upload
-with `glance`.
+And now you can e.g. upload this image with [glance](https://docs.openstack.org/python-glanceclient/latest/cli/details.html).
 
 There's more artifacts, for example use `--iso` to get the `metal` live ISO.
+
+If you use `--to-stdout` when extracting multiple things (e.g. `--iso --disk qemu` to get both the ISO
+and `qemu.qcow2`, then the output stream will be a tarball you can extract via piping to `tar xf -`).
+
+Use `--help` to see other commands.  Notice in the above invocation, we chose the filename, and we also don't
+have the version number.  This information can currently be retrieved via the `print-stream-json` command,
+which outputs the [stream metadata](https://docs.fedoraproject.org/en-US/fedora-coreos/stream-metadata/)
+stored in the image.
 
 As of right now, the original (compressed) images total `4.55GiB`, and the container image is `1.63GiB`,
 so a savings of `64%` which isn't bad.  But there's more we can do here - see the issues list for details
