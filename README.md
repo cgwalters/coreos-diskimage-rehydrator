@@ -132,5 +132,6 @@ Reproducing squashfs bit may require using a fork:
 
 ### What is "rehydration"?
 
-A tip of the hat to https://en.wikipedia.org/wiki/The_Three-Body_Problem_(novel) where an alien species can "dehydrate" during times of crisis and "rehydrate" when it's over.
-Here crisis is analogous to compression, rehydration to decompression.
+A tip of the hat to https://en.wikipedia.org/wiki/The_Three-Body_Problem_(novel) where
+an alien species can "dehydrate" during times of crisis to a thinned-out version that
+can be stored, then "rehydrate" when it's over.
