@@ -458,8 +458,7 @@ fn uncompressor_for(name: &Utf8Path, src: impl Read) -> Result<impl Read> {
 
 fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
     let name = Utf8Path::new(a.filename());
-    let uncomp_name = cached_uncompressed_name(a)?;
-    let r = uncomp_name
+    let r = cached_uncompressed_name(a)?
         .map(|(uncomp_name, is_vmdk)| {
             if !uncomp_name.exists() {
                 let src = File::open(name).with_context(|| anyhow!("Failed to open {}", name))?;
@@ -479,8 +478,9 @@ fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
             }
             Ok::<_, anyhow::Error>(uncomp_name)
         })
-        .transpose()?;
-    Ok(r.unwrap_or_else(|| name.into()))
+        .transpose()?
+        .unwrap_or_else(|| name.into());
+    Ok(r)
 }
 
 // Generate an image from its rsync delta.
