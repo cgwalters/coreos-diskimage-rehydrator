@@ -5,10 +5,11 @@
 
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
+use coreos_stream_metadata::Artifact;
 use coreos_stream_metadata::Stream as CoreStream;
-use coreos_stream_metadata::{Artifact, Stream};
 use fn_error_context::context;
 use rayon::prelude::*;
+use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::path::Path;
@@ -16,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tracing::{debug, info};
 
+use crate::riverdelta::RiverDelta;
+
 mod qemu_img;
+mod riverdelta;
 mod rsync;
 mod utils;
 
@@ -28,14 +32,6 @@ const CACHEDIR: &str = "dehydrate-cache";
 const STREAM_FILE: &str = "stream.json";
 /// Number of CPUs we'll use
 const N_WORKERS: u32 = 2;
-/// The qemu name
-const QEMU: &str = "qemu";
-/// AWS is vmdk so handled specially
-const AWS: &str = "aws";
-// openstack and ibmcloud are just qcow2 images.
-// gcp is a tarball with a sparse disk image inside it, but for rsync that's
-// not really different than a qcow2.
-const RSYNC_STRATEGY_DISK: &[&str] = &["openstack", "ibmcloud", "gcp"];
 
 // TODO: aws.vmdk is internally compressed.  We need to replicate the qemu-img arguments,
 // and also handle the CID.
@@ -232,13 +228,11 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     let stream_path = &srcdir.join(STREAM_FILE);
     let s = File::open(stream_path).context("Failed to open stream.json")?;
     let s: CoreStream = serde_json::from_reader(std::io::BufReader::new(s))?;
-    let thisarch = s
-        .this_architecture()
-        .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
+    let riverdelta: RiverDelta = s.try_into()?;
     if opts.iso {
-        let metal = thisarch
-            .artifacts
-            .get("metal")
+        let metal = riverdelta
+            .metal
+            .as_ref()
             .ok_or_else(|| anyhow!("Missing metal"))?;
         let rootfs = metal
             .formats
@@ -269,9 +263,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
 
     if !opts.disk.is_empty() {
         // Need to decompress the qemu image
-        let qemu = s
-            .query_thisarch_single(QEMU)
-            .ok_or_else(|| anyhow!("Missing {}", QEMU))?;
+        let qemu = &riverdelta.qemu;
         let qemu_fn = Utf8Path::new(uncompressed_name(filename_for_artifact(qemu)?));
         if !qemu_fn.exists() {
             {
@@ -291,11 +283,14 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
         }
         opts.disk
             .par_iter()
-            .filter(|s| s.as_str() != QEMU)
+            .filter(|s| s.as_str() != riverdelta::QEMU)
             .try_for_each(|disk| {
-                let a = s
-                    .query_thisarch_single(disk)
-                    .ok_or_else(|| anyhow!("Failed to find disk for {}", disk))?;
+                if riverdelta.unhandled.contains_key(disk) {
+                    return Err(anyhow!("Unhandled artifact: {}", disk));
+                }
+                let a = riverdelta
+                    .get_rsyncable(disk)
+                    .ok_or_else(|| anyhow!("Unknown artifact: {}", disk))?;
                 let artifact_filename = Utf8Path::new(filename_for_artifact(a)?);
                 let uncompressed_name =
                     Utf8Path::new(uncompressed_name(artifact_filename.as_str()));
@@ -316,7 +311,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 }
                 Ok::<_, anyhow::Error>(())
             })?;
-        if opts.disk.iter().any(|s| s.as_str() == QEMU) {
+        if opts.disk.iter().any(|s| s.as_str() == riverdelta::QEMU) {
             print!("Generated: {}", qemu_fn);
         }
     }
@@ -458,11 +453,8 @@ fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
 }
 
 // Generate an image from its rsync delta.
-fn dehydrate_rsyncable(s: &Stream, qemu: &Artifact, name: &str, destdir: &Utf8Path) -> Result<()> {
-    let a = s
-        .query_thisarch_single(name)
-        .ok_or_else(|| anyhow!("Missing artifact {}", name))?;
-    let _found: bool = rsync_delta(qemu, a, destdir)?;
+fn dehydrate_rsyncable(qemu: &Artifact, target: &Artifact, destdir: &Utf8Path) -> Result<()> {
+    let _found: bool = rsync_delta(qemu, target, destdir)?;
     Ok(())
 }
 
@@ -470,15 +462,11 @@ fn dehydrate_rsyncable(s: &Stream, qemu: &Artifact, name: &str, destdir: &Utf8Pa
 fn build_dehydrate() -> Result<()> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = read_stream()?;
+    let riverdelta: RiverDelta = s.try_into()?;
 
     std::fs::create_dir_all(CACHEDIR).context("Creating cachedir")?;
 
-    let thisarch = s
-        .this_architecture()
-        .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
-    let qemu = s
-        .query_thisarch_single("qemu")
-        .ok_or_else(|| anyhow!("Missing qemu image"))?;
+    let qemu = &riverdelta.qemu;
     let uncomp_qemu = &get_maybe_uncompressed(qemu)?;
     let destdir = camino::Utf8Path::new(DIR);
     std::fs::create_dir(destdir)
@@ -486,7 +474,7 @@ fn build_dehydrate() -> Result<()> {
 
     hardlink(stream_path, destdir.join(stream_path.file_name().unwrap()))?;
 
-    if let Some(metal) = thisarch.artifacts.get("metal") {
+    if let Some(metal) = riverdelta.metal.as_ref() {
         // The rootfs (squashfs-in-cpio) is a source artifact for the ISO
         let rootfs = if let Some(pxe) = metal.formats.get("pxe") {
             let rootfs = pxe
@@ -519,16 +507,32 @@ fn build_dehydrate() -> Result<()> {
         .unwrap();
     pool.install(|| {
         // The rsyncable artifacts are easy.
-        RSYNC_STRATEGY_DISK
+        riverdelta
+            .qemu_rsyncable_artifacts
             .par_iter()
-            .map(|&name| dehydrate_rsyncable(&s, qemu, name, destdir))
-            .chain(rayon::iter::once(AWS).map(|name| dehydrate_rsyncable(&s, qemu, name, destdir)))
+            .map(|(_name, target)| dehydrate_rsyncable(qemu, target, destdir))
+            .chain(
+                riverdelta
+                    .aws
+                    .par_iter()
+                    .map(|aws| dehydrate_rsyncable(qemu, aws, destdir)),
+            )
             .try_reduce(|| (), |_, _| Ok(()))?;
         Ok::<_, anyhow::Error>(())
     })?;
 
     info!("Including (zstd compressed): {}", qemu_dest);
     zstd_compress(qemu_dest)?;
+
+    if !riverdelta.unhandled.is_empty() {
+        let s = std::io::stdout();
+        let mut s = s.lock();
+        write!(s, "Unhandled:")?;
+        for k in riverdelta.unhandled.keys() {
+            write!(s, " {}", k)?;
+        }
+        writeln!(s, "")?;
+    }
 
     Ok(())
 }
@@ -585,9 +589,7 @@ fn build_init(stream: &str) -> Result<()> {
 
 fn build_download() -> Result<()> {
     let s = read_stream()?;
-    let thisarch = s
-        .this_architecture()
-        .ok_or_else(|| anyhow!("Missing this architecture in stream metadata"))?;
+    let riverdelta: RiverDelta = s.try_into()?;
     let client = reqwest::blocking::ClientBuilder::new()
         .user_agent(concat!(
             env!("CARGO_PKG_NAME"),
@@ -598,13 +600,15 @@ fn build_download() -> Result<()> {
         .build()?;
     let artifacts = {
         let mut artifacts = Vec::new();
-        for name in RSYNC_STRATEGY_DISK.iter().chain([QEMU, AWS].iter()) {
-            let a = s
-                .query_thisarch_single(name)
-                .ok_or_else(|| anyhow!("Missing {}", name))?;
-            artifacts.push(a);
-        }
-        if let Some(metal) = thisarch.artifacts.get("metal") {
+        artifacts.push(&riverdelta.qemu);
+        artifacts.extend(riverdelta.aws.as_ref().iter());
+        artifacts.extend(
+            riverdelta
+                .qemu_rsyncable_artifacts
+                .iter()
+                .map(|(_name, v)| v),
+        );
+        if let Some(metal) = riverdelta.metal.as_ref() {
             if let Some(pxe) = metal.formats.get("pxe") {
                 let rootfs = pxe
                     .get("rootfs")
