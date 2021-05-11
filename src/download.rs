@@ -1,4 +1,4 @@
-use crate::riverdelta::RiverDelta;
+use crate::riverdelta::{ArtifactExt, RiverDelta};
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
 use rayon::prelude::*;
@@ -49,7 +49,7 @@ pub(crate) fn build_download() -> Result<()> {
         artifacts.par_iter().try_for_each_init(
             || client.clone(),
             |client, &a| -> Result<()> {
-                let fname = Utf8Path::new(crate::filename_for_artifact(a)?);
+                let fname = Utf8Path::new(a.filename());
                 if fname.exists() {
                     return Ok(());
                 }
@@ -69,9 +69,7 @@ pub(crate) fn build_download() -> Result<()> {
         .try_fold(
             || 0u64,
             |acc, &artifact| {
-                let artifact_size = Utf8Path::new(crate::filename_for_artifact(artifact)?)
-                    .metadata()?
-                    .len();
+                let artifact_size = Utf8Path::new(artifact.filename()).metadata()?.len();
                 Ok::<_, anyhow::Error>(acc + artifact_size)
             },
         )
