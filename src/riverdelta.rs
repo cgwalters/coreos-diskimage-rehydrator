@@ -8,10 +8,20 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
 
-// openstack and ibmcloud are just qcow2 images.
+// Most of these are just just qcow2 images.
 // gcp is a tarball with a sparse disk image inside it, but for rsync that's
 // not really different than a qcow2.
-const RSYNC_STRATEGY_DISK: &[&str] = &["openstack", "ibmcloud", "gcp"];
+// A few others are raw disk images (azure, vultr).
+const RSYNC_STRATEGY_DISK: &[&str] = &[
+    "aliyun",
+    "azure",
+    "exoscale",
+    "openstack",
+    "ibmcloud",
+    "gcp",
+    "digitalocean",
+    "vultr",
+];
 pub(crate) const QEMU: &str = "qemu";
 const METAL: &str = "metal";
 const AWS: &str = "aws";
