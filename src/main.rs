@@ -19,6 +19,7 @@ use tracing::{debug, info};
 
 use crate::riverdelta::RiverDelta;
 
+mod download;
 mod qemu_img;
 mod riverdelta;
 mod rsync;
@@ -31,7 +32,7 @@ const CACHEDIR: &str = "dehydrate-cache";
 /// The name of our stream file
 const STREAM_FILE: &str = "stream.json";
 /// Number of CPUs we'll use
-const N_WORKERS: u32 = 2;
+pub(crate) const N_WORKERS: u32 = 2;
 
 // TODO: aws.vmdk is internally compressed.  We need to replicate the qemu-img arguments,
 // and also handle the CID.
@@ -115,12 +116,12 @@ fn run() -> Result<()> {
         }
         Opt::Build(b) => match b {
             Build::Init { ref stream } => build_init(stream.as_str()),
-            Build::Download => build_download(),
+            Build::Download => download::build_download(),
             Build::Dehydrate => build_dehydrate(),
             Build::Clean => build_clean(),
             Build::Run { ref stream } => {
                 build_init(stream.as_str())?;
-                build_download()?;
+                download::build_download()?;
                 build_dehydrate()?;
                 build_clean()?;
                 Ok(())
@@ -338,7 +339,7 @@ fn uncompressed_name(s: &str) -> &str {
     maybe_uncompressed_name(s).unwrap_or(s)
 }
 
-fn filename_for_artifact(a: &Artifact) -> Result<&str> {
+pub(crate) fn filename_for_artifact(a: &Artifact) -> Result<&str> {
     Ok(Utf8Path::new(&a.location)
         .file_name()
         .ok_or_else(|| anyhow!("Invalid artifact location: {}", a.location))?)
@@ -394,7 +395,7 @@ fn rsync_delta(src: &Artifact, target: &Artifact, destdir: impl AsRef<Utf8Path>)
     Ok(true)
 }
 
-fn read_stream() -> Result<CoreStream> {
+pub(crate) fn read_stream() -> Result<CoreStream> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = File::open(stream_path).context("Failed to open stream.json")?;
     let s: CoreStream = serde_json::from_reader(std::io::BufReader::new(s))?;
@@ -584,82 +585,5 @@ fn build_init(stream: &str) -> Result<()> {
     let mut resp = reqwest::blocking::get(&u)?;
     resp.copy_to(&mut out)?;
     out.flush()?;
-    Ok(())
-}
-
-fn build_download() -> Result<()> {
-    let s = read_stream()?;
-    let riverdelta: RiverDelta = s.try_into()?;
-    let client = reqwest::blocking::ClientBuilder::new()
-        .user_agent(concat!(
-            env!("CARGO_PKG_NAME"),
-            "/",
-            env!("CARGO_PKG_VERSION"),
-        ))
-        .https_only(true)
-        .build()?;
-    let artifacts = {
-        let mut artifacts = Vec::new();
-        artifacts.push(&riverdelta.qemu);
-        artifacts.extend(riverdelta.aws.as_ref().iter());
-        artifacts.extend(
-            riverdelta
-                .qemu_rsyncable_artifacts
-                .iter()
-                .map(|(_name, v)| v),
-        );
-        if let Some(metal) = riverdelta.metal.as_ref() {
-            if let Some(pxe) = metal.formats.get("pxe") {
-                let rootfs = pxe
-                    .get("rootfs")
-                    .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
-                artifacts.push(rootfs)
-            }
-            // If we have an ISO, delta it from the rootfs
-            if let Some(iso) = metal.formats.get("iso") {
-                artifacts.push(iso.get("disk").ok_or_else(|| anyhow!("Invalid iso"))?);
-            }
-        }
-        artifacts
-    };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(N_WORKERS as usize)
-        .build()
-        .unwrap();
-    pool.install(|| -> Result<_> {
-        artifacts.par_iter().try_for_each_init(
-            || client.clone(),
-            |client, &a| -> Result<()> {
-                let fname = Utf8Path::new(filename_for_artifact(a)?);
-                if fname.exists() {
-                    return Ok(());
-                }
-                let temp_name = &format!("{}.tmp", fname);
-                let mut out = std::io::BufWriter::new(File::create(temp_name)?);
-                let mut resp = client.get(a.location.as_str()).send()?;
-                resp.copy_to(&mut out)
-                    .with_context(|| anyhow!("Failed to download {}", a.location))?;
-                std::fs::rename(temp_name, fname)?;
-                info!("Downloaded: {}", fname);
-                Ok(())
-            },
-        )
-    })?;
-    let size: u64 = artifacts
-        .par_iter()
-        .try_fold(
-            || 0u64,
-            |acc, &artifact| {
-                let artifact_size = Utf8Path::new(filename_for_artifact(artifact)?)
-                    .metadata()?
-                    .len();
-                Ok::<_, anyhow::Error>(acc + artifact_size)
-            },
-        )
-        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
-    info!(
-        "Original artifact total size: {}",
-        indicatif::HumanBytes(size)
-    );
     Ok(())
 }
