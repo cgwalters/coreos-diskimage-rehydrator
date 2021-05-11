@@ -536,7 +536,7 @@ fn build_dehydrate() -> Result<()> {
         let metadata = Metadata {
             original_artifact_size,
         };
-        let w = std::io::BufWriter::new(File::create(METADATA_FILE)?);
+        let w = std::io::BufWriter::new(File::create(destdir.join(METADATA_FILE))?);
         serde_json::to_writer_pretty(w, &metadata)?;
     }
 
