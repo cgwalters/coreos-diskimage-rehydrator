@@ -212,6 +212,7 @@ dependencies = [
  "serde_bytes",
  "serde_derive",
  "serde_json",
+ "smallvec",
  "structopt",
  "tar",
  "tempfile",
