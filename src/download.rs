@@ -18,30 +18,7 @@ pub(crate) fn build_download() -> Result<()> {
         ))
         .https_only(true)
         .build()?;
-    let artifacts = {
-        let mut artifacts = Vec::new();
-        artifacts.push(&riverdelta.qemu);
-        artifacts.extend(riverdelta.aws.as_ref().iter());
-        artifacts.extend(
-            riverdelta
-                .qemu_rsyncable_artifacts
-                .iter()
-                .map(|(_name, v)| v),
-        );
-        if let Some(metal) = riverdelta.metal.as_ref() {
-            if let Some(pxe) = metal.formats.get("pxe") {
-                let rootfs = pxe
-                    .get("rootfs")
-                    .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
-                artifacts.push(rootfs)
-            }
-            // If we have an ISO, delta it from the rootfs
-            if let Some(iso) = metal.formats.get("iso") {
-                artifacts.push(iso.get("disk").ok_or_else(|| anyhow!("Invalid iso"))?);
-            }
-        }
-        artifacts
-    };
+    let artifacts = riverdelta.all_artifacts();
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(crate::N_WORKERS as usize)
         .build()
@@ -77,16 +54,7 @@ pub(crate) fn build_download() -> Result<()> {
                 },
             )
     })?;
-    let size: u64 = artifacts
-        .par_iter()
-        .try_fold(
-            || 0u64,
-            |acc, &artifact| {
-                let artifact_size = Utf8Path::new(artifact.filename()).metadata()?.len();
-                Ok::<_, anyhow::Error>(acc + artifact_size)
-            },
-        )
-        .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+    let size = riverdelta.original_compressed_size()?;
     info!(
         "Original artifact total size: {}",
         indicatif::HumanBytes(size)

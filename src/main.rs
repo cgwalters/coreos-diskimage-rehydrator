@@ -10,6 +10,7 @@ use coreos_stream_metadata::Artifact;
 use coreos_stream_metadata::Stream as CoreStream;
 use fn_error_context::context;
 use rayon::prelude::*;
+use serde_derive::{Deserialize, Serialize};
 use std::convert::TryInto;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -30,6 +31,8 @@ const DIR: &str = "coreos-images-dehydrated";
 const CACHEDIR: &str = "dehydrate-cache";
 /// The name of our stream file
 const STREAM_FILE: &str = "stream.json";
+/// Name of metadata file
+const METADATA_FILE: &str = "meta.json";
 /// Number of CPUs we'll use
 pub(crate) const N_WORKERS: u32 = 2;
 
@@ -101,6 +104,11 @@ enum Opt {
     Build(Build),
     /// Regenerate target file
     Rehydrate(RehydrateOpts),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Metadata {
+    original_artifact_size: u64,
 }
 
 fn run() -> Result<()> {
@@ -254,27 +262,15 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
             .metal
             .as_ref()
             .ok_or_else(|| anyhow!("Missing metal"))?;
-        let rootfs = metal
-            .formats
-            .get("pxe")
-            .map(|p| p.get("rootfs"))
-            .flatten()
-            .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
-        let iso = metal
-            .formats
-            .get("iso")
-            .map(|p| p.get("disk"))
-            .flatten()
-            .ok_or_else(|| anyhow!("Missing metal/iso/disk"))?;
-        let iso_fn = iso.filename();
-        let patch = srcdir.join(rdelta_name_for_artifact(iso)?);
+        let iso_fn = metal.iso.filename();
+        let patch = srcdir.join(rdelta_name_for_artifact(&metal.iso)?);
         rsync::apply(
-            &srcdir.join(rootfs.filename()),
+            &srcdir.join(metal.pxe.rootfs.filename()),
             iso_fn,
             Utf8Path::new("."),
             patch,
         )?;
-        finish_output(ctx, iso, iso_fn)?;
+        finish_output(ctx, &metal.iso, iso_fn)?;
     }
 
     if opts.pxe {
@@ -487,24 +483,9 @@ fn build_dehydrate() -> Result<()> {
 
     if let Some(metal) = riverdelta.metal.as_ref() {
         // The rootfs (squashfs-in-cpio) is a source artifact for the ISO
-        let rootfs = if let Some(pxe) = metal.formats.get("pxe") {
-            let rootfs = pxe
-                .get("rootfs")
-                .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
-            let rootfs_name = rootfs.filename();
-            hardlink(rootfs_name, destdir.join(rootfs_name))?;
-            Some(rootfs)
-        } else {
-            None
-        };
-        // If we have an ISO, delta it from the rootfs
-        if let Some(iso) = metal.formats.get("iso") {
-            let iso = iso
-                .get("disk")
-                .ok_or_else(|| anyhow!("Missing disk for metal/iso"))?;
-            let rootfs = rootfs.ok_or_else(|| anyhow!("Found iso without pxe/rootfs"))?;
-            let _found: bool = rsync_delta(rootfs, iso, destdir)?;
-        }
+        let rootfs_name = metal.pxe.rootfs.filename();
+        hardlink(rootfs_name, destdir.join(rootfs_name))?;
+        let _found: bool = rsync_delta(&metal.pxe.rootfs, &metal.iso, destdir)?;
     }
 
     // Link in the qemu image now, we'll compress it at the end
@@ -534,6 +515,39 @@ fn build_dehydrate() -> Result<()> {
 
     info!("Including (zstd compressed): {}", qemu_dest);
     zstd_compress(qemu_dest)?;
+
+    let original_artifact_size = riverdelta.original_compressed_size()?;
+    // TODO record exact filenames we expect
+    let new_size = std::fs::read_dir(destdir)?
+        .into_iter()
+        .try_fold(0u64, |acc, f| {
+            let f = f?;
+            let l = if f.file_type()?.is_file() {
+                f.metadata()?.len()
+            } else {
+                0
+            };
+            Ok::<_, anyhow::Error>(acc + l)
+        })
+        .context("Computing new size")?;
+
+    // Write metadata JSON
+    {
+        let metadata = Metadata {
+            original_artifact_size,
+        };
+        let w = std::io::BufWriter::new(File::create(METADATA_FILE)?);
+        serde_json::to_writer_pretty(w, &metadata)?;
+    }
+
+    info!(
+        "Original artifact total size: {}",
+        indicatif::HumanBytes(original_artifact_size)
+    );
+    info!(
+        "Dehydrated artifact total size: {}",
+        indicatif::HumanBytes(new_size)
+    );
 
     if !riverdelta.unhandled.is_empty() {
         let s = std::io::stdout();

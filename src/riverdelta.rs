@@ -2,9 +2,10 @@
 //! This module manages a "parsed" version of a stream that is
 //! organized around how we manage deltas.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
 use coreos_stream_metadata::{Artifact, Platform, Stream};
+use fn_error_context::context;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::convert::TryFrom;
@@ -32,19 +33,33 @@ pub(crate) trait ArtifactExt {
     fn filename(&self) -> &str;
 }
 
+pub(crate) struct MetalPXE {
+    pub(crate) kernel: Artifact,
+    pub(crate) initramfs: Artifact,
+    pub(crate) rootfs: Artifact,
+}
+
+pub(crate) struct Metal {
+    pub(crate) iso: Artifact,
+    pub(crate) pxe: MetalPXE,
+}
+
 /// A parsed stream with data for the current CPU architecture,
 /// split up by delta strategy.
 pub(crate) struct RiverDelta {
     /// Name of the stream.
     pub stream: String,
 
+    /// Used as a basis for the qemu_rsyncable_artifact set.
+    pub(crate) qemu: Artifact,
+    /// Images which derive from qemu.
     pub(crate) qemu_rsyncable_artifacts: HashMap<String, Artifact>,
     /// This is the VMDK, not the AMIs.
     pub(crate) aws: Option<Artifact>,
+    /// The Live ISO and PXE data
+    pub(crate) metal: Option<Metal>,
+    /// Unhandled set.
     pub(crate) unhandled: HashMap<String, Platform>,
-
-    pub(crate) qemu: Artifact,
-    pub(crate) metal: Option<Platform>,
 }
 
 impl RiverDelta {
@@ -53,6 +68,41 @@ impl RiverDelta {
             return self.aws.as_ref();
         }
         self.qemu_rsyncable_artifacts.get(name)
+    }
+
+    /// Get all artifacts.
+    pub(crate) fn all_artifacts(&self) -> Vec<&Artifact> {
+        use std::iter::once;
+        once(&self.qemu)
+            .chain(self.qemu_rsyncable_artifacts.values())
+            .chain(self.aws.as_ref())
+            .chain(
+                self.metal
+                    .iter()
+                    .flat_map(|p| vec![&p.iso, &p.pxe.kernel, &p.pxe.initramfs, &p.pxe.rootfs]),
+            )
+            .collect()
+    }
+
+    /// Size in bytes of the original artifacts (compressed).
+    #[context("Computing original compressed size")]
+    pub(crate) fn original_compressed_size(&self) -> Result<u64> {
+        let r = self
+            .all_artifacts()
+            .into_par_iter()
+            .map(|a| Utf8Path::new(a.filename()))
+            .try_fold(
+                || 0u64,
+                |acc, filename| {
+                    let artifact_size = filename
+                        .metadata()
+                        .with_context(|| anyhow!("Finding metadata for {}", filename))?
+                        .len();
+                    Ok::<_, anyhow::Error>(acc + artifact_size)
+                },
+            )
+            .try_reduce(|| 0u64, |a, b| Ok(a + b))?;
+        Ok(r)
     }
 }
 
@@ -91,7 +141,37 @@ impl TryFrom<Stream> for RiverDelta {
             .remove(QEMU)
             .ok_or_else(|| anyhow!("Missing qemu"))?;
         let qemu = platform_disk_artifact(qemu)?;
-        let metal = thisarch.artifacts.remove(METAL);
+        let metal = thisarch
+            .artifacts
+            .remove(METAL)
+            .map(|mut m| {
+                let iso = m
+                    .formats
+                    .remove("iso")
+                    .ok_or_else(|| anyhow!("metal missing `iso`"))?
+                    .remove("disk")
+                    .ok_or_else(|| anyhow!("metal/iso missing disk"))?;
+                let mut pxe = m
+                    .formats
+                    .remove("pxe")
+                    .ok_or_else(|| anyhow!("metal missing `pxe`"))?;
+                let kernel = pxe
+                    .remove("kernel")
+                    .ok_or_else(|| anyhow!("metal/pxe missing kernel"))?;
+                let initramfs = pxe
+                    .remove("initramfs")
+                    .ok_or_else(|| anyhow!("metal/pxe missing initramfs"))?;
+                let rootfs = pxe
+                    .remove("rootfs")
+                    .ok_or_else(|| anyhow!("metal/pxe missing rootfs"))?;
+                let pxe = MetalPXE {
+                    kernel,
+                    initramfs,
+                    rootfs,
+                };
+                Ok::<_, anyhow::Error>(Metal { iso, pxe })
+            })
+            .transpose()?;
         let aws = thisarch
             .artifacts
             .remove(AWS)
