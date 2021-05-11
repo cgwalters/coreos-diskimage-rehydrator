@@ -131,6 +131,26 @@ fn run() -> Result<()> {
     }
 }
 
+/// Initialize directory with stream data
+fn build_init(stream: &str) -> Result<()> {
+    let u = coreos_stream_metadata::stream_url_from_id(stream)?;
+    if Utf8Path::new(STREAM_FILE).exists() {
+        return Err(anyhow!("{} exists, not overwriting", STREAM_FILE));
+    }
+    info!("Downloading {}", u);
+    let mut out = std::io::BufWriter::new(
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(STREAM_FILE)?,
+    );
+    let mut resp = reqwest::blocking::get(&u)?;
+    resp.copy_to(&mut out)?;
+    out.flush()?;
+    Ok(())
+}
+
+/// Clean cached data from the current directory.
 fn build_clean() -> Result<()> {
     let cachedir = Utf8Path::new(CACHEDIR);
     if cachedir.exists() {
@@ -568,22 +588,4 @@ mod tests {
     fn test_strip_suffix() {
         assert_eq!(uncompressed_name("foo.xz"), "foo");
     }
-}
-
-fn build_init(stream: &str) -> Result<()> {
-    let u = coreos_stream_metadata::stream_url_from_id(stream)?;
-    if Utf8Path::new(STREAM_FILE).exists() {
-        return Err(anyhow!("{} exists, not overwriting", STREAM_FILE));
-    }
-    info!("Downloading {}", u);
-    let mut out = std::io::BufWriter::new(
-        OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(STREAM_FILE)?,
-    );
-    let mut resp = reqwest::blocking::get(&u)?;
-    resp.copy_to(&mut out)?;
-    out.flush()?;
-    Ok(())
 }
