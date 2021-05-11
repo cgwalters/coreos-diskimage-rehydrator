@@ -3,6 +3,7 @@
 //! organized around how we manage deltas.
 
 use anyhow::{anyhow, Result};
+use camino::Utf8Path;
 use coreos_stream_metadata::{Artifact, Platform, Stream};
 use rayon::prelude::*;
 use std::collections::HashMap;
@@ -25,6 +26,11 @@ const RSYNC_STRATEGY_DISK: &[&str] = &[
 pub(crate) const QEMU: &str = "qemu";
 const METAL: &str = "metal";
 const AWS: &str = "aws";
+
+/// Extension trait for Artifact.
+pub(crate) trait ArtifactExt {
+    fn filename(&self) -> &str;
+}
 
 /// A parsed stream with data for the current CPU architecture,
 /// split up by delta strategy.
@@ -50,14 +56,23 @@ impl RiverDelta {
     }
 }
 
+fn validate_artifact(a: Artifact) -> Result<Artifact> {
+    if Utf8Path::new(a.location.as_str()).file_name().is_none() {
+        return Err(anyhow!("Missing filename in {}", a.location));
+    }
+    Ok(a)
+}
+
 fn platform_disk_artifact(p: Platform) -> Result<Artifact> {
-    p.formats
+    let a = p
+        .formats
         .into_iter()
         .next()
         .ok_or_else(|| anyhow!("Empty platform"))?
         .1
         .remove("disk")
-        .ok_or_else(|| anyhow!("Missing 'disk' entry for platform"))
+        .ok_or_else(|| anyhow!("Missing 'disk' entry for platform"))?;
+    validate_artifact(a)
 }
 
 impl TryFrom<Stream> for RiverDelta {
@@ -102,5 +117,14 @@ impl TryFrom<Stream> for RiverDelta {
             metal,
             unhandled,
         })
+    }
+}
+
+impl ArtifactExt for Artifact {
+    // Return the filename for the artifact.
+    //
+    // This was validated at parse time for a RiverDelta.
+    fn filename(&self) -> &str {
+        Utf8Path::new(&self.location).file_name().unwrap()
     }
 }

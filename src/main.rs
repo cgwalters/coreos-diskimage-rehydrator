@@ -3,6 +3,7 @@
 #![deny(unused_must_use)]
 #![deny(unsafe_code)]
 
+use crate::riverdelta::{ArtifactExt, RiverDelta};
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use coreos_stream_metadata::Artifact;
@@ -16,8 +17,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tracing::{debug, info};
-
-use crate::riverdelta::RiverDelta;
 
 mod download;
 mod qemu_img;
@@ -267,10 +266,10 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
             .map(|p| p.get("disk"))
             .flatten()
             .ok_or_else(|| anyhow!("Missing metal/iso/disk"))?;
-        let iso_fn = filename_for_artifact(iso)?;
+        let iso_fn = iso.filename();
         let patch = srcdir.join(rdelta_name_for_artifact(iso)?);
         rsync::apply(
-            &srcdir.join(filename_for_artifact(rootfs)?),
+            &srcdir.join(rootfs.filename()),
             iso_fn,
             Utf8Path::new("."),
             patch,
@@ -285,7 +284,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
     if !opts.disk.is_empty() {
         // Need to decompress the qemu image
         let qemu = &riverdelta.qemu;
-        let qemu_fn = Utf8Path::new(uncompressed_name(filename_for_artifact(qemu)?));
+        let qemu_fn = Utf8Path::new(uncompressed_name(qemu.filename()));
         if !qemu_fn.exists() {
             {
                 let qemu_zstd_path =
@@ -312,7 +311,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
                 let a = riverdelta
                     .get_rsyncable(disk)
                     .ok_or_else(|| anyhow!("Unknown artifact: {}", disk))?;
-                let artifact_filename = Utf8Path::new(filename_for_artifact(a)?);
+                let artifact_filename = Utf8Path::new(a.filename());
                 let uncompressed_name =
                     Utf8Path::new(uncompressed_name(artifact_filename.as_str()));
                 let patch = srcdir.join(rdelta_name_for_artifact(a)?);
@@ -359,12 +358,6 @@ fn uncompressed_name(s: &str) -> &str {
     maybe_uncompressed_name(s).unwrap_or(s)
 }
 
-pub(crate) fn filename_for_artifact(a: &Artifact) -> Result<&str> {
-    Ok(Utf8Path::new(&a.location)
-        .file_name()
-        .ok_or_else(|| anyhow!("Invalid artifact location: {}", a.location))?)
-}
-
 fn hardlink(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> Result<()> {
     let src = src.as_ref();
     let dest = dest.as_ref();
@@ -387,10 +380,7 @@ fn zstd_compress(src: impl AsRef<Utf8Path>) -> Result<Utf8PathBuf> {
 }
 
 fn rdelta_name_for_artifact(a: &Artifact) -> Result<String> {
-    Ok(format!(
-        "{}.rdelta",
-        uncompressed_name(filename_for_artifact(a)?)
-    ))
+    Ok(format!("{}.rdelta", uncompressed_name(a.filename())))
 }
 
 #[context("Creating rsync delta")]
@@ -423,7 +413,7 @@ pub(crate) fn read_stream() -> Result<CoreStream> {
 }
 
 fn cached_uncompressed_name(a: &Artifact) -> Result<Option<(Utf8PathBuf, bool)>> {
-    let name = filename_for_artifact(a)?;
+    let name = a.filename();
     let r = maybe_uncompressed_name(name)
         .map(|uncomp_name| Utf8Path::new(CACHEDIR).join(uncomp_name))
         .map(|p| {
@@ -447,7 +437,7 @@ fn uncompressor_for(name: &Utf8Path, src: impl Read) -> Result<impl Read> {
 }
 
 fn get_maybe_uncompressed(a: &Artifact) -> Result<Utf8PathBuf> {
-    let name = Utf8Path::new(filename_for_artifact(a)?);
+    let name = Utf8Path::new(a.filename());
     let uncomp_name = cached_uncompressed_name(a)?;
     let r = uncomp_name
         .map(|(uncomp_name, is_vmdk)| {
@@ -501,7 +491,7 @@ fn build_dehydrate() -> Result<()> {
             let rootfs = pxe
                 .get("rootfs")
                 .ok_or_else(|| anyhow!("Missing metal/pxe/rootfs"))?;
-            let rootfs_name = filename_for_artifact(rootfs)?;
+            let rootfs_name = rootfs.filename();
             hardlink(rootfs_name, destdir.join(rootfs_name))?;
             Some(rootfs)
         } else {
