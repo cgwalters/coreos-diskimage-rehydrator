@@ -68,11 +68,11 @@ struct RehydrateOpts {
     #[structopt(long)]
     skip_validate: bool,
 
-    /// Output image(s) to stdout; if multiple images are specified,
-    /// the output will be `tar` format that can be extracted by
-    /// piping to e.g. `tar xf -`.
-    #[structopt(long)]
-    to_stdout: bool,
+    /// Directory to use for image output.  If `-`, use stdout.
+    /// If multiple images are specified with `-`, then a GNU tar
+    /// stream will be used that can be uncompressed by piping
+    /// to e.g. `| tar xf -`.
+    dest: String,
 }
 
 /// Commands used to dehydrate images
@@ -144,6 +144,7 @@ fn build_clean() -> Result<()> {
 }
 
 enum OutputTarget<W: std::io::Write> {
+    Directory(Utf8PathBuf),
     Stdout(W),
     Tar(tar::Builder<W>),
 }
@@ -161,17 +162,20 @@ fn write_output<W: std::io::Write>(
     let target = target.as_ref();
     let mut outtarget = ctx.target.lock().unwrap();
     match &mut *outtarget {
+        OutputTarget::Directory(ref d) => {
+            std::fs::rename(target, d.join(target.file_name().unwrap()))
+                .with_context(|| format!("Failed to move {} to {}", target, d))?;
+        }
         OutputTarget::Stdout(ref mut s) => {
             let mut src = std::io::BufReader::new(File::open(target)?);
             std::io::copy(&mut src, s)?;
-            Ok(())
         }
         OutputTarget::Tar(ref mut t) => {
             let mut src = File::open(target)?;
             t.append_file(target.file_name().unwrap(), &mut src)?;
-            Ok(())
         }
     }
+    Ok(())
 }
 
 fn finish_output<W: std::io::Write>(
@@ -209,14 +213,14 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
 
     let have_multiple = (opts.iso && !opts.disk.is_empty()) || opts.disk.len() > 1;
     let stdout = std::io::stdout();
-
-    let target = if have_multiple {
-        OutputTarget::Tar(tar::Builder::new(stdout))
-    } else {
-        if nix::unistd::isatty(1)? {
-            return Err(anyhow!("Refusing to output to a tty"));
-        }
-        OutputTarget::Stdout(stdout)
+    let is_stdout = opts.dest == "-";
+    if is_stdout && nix::unistd::isatty(1)? {
+        return Err(anyhow!("Refusing to output to a tty"));
+    }
+    let target = match (is_stdout, have_multiple) {
+        (true, true) => OutputTarget::Tar(tar::Builder::new(stdout)),
+        (true, false) => OutputTarget::Stdout(stdout),
+        (_, _) => OutputTarget::Directory(opts.dest.clone().into()),
     };
 
     let ctx = &RehydrateContext {
@@ -319,6 +323,7 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
 
     let mut target = ctx.target.lock().unwrap();
     match &mut *target {
+        OutputTarget::Directory(_) => {}
         OutputTarget::Stdout(s) => {
             s.flush()?;
         }
