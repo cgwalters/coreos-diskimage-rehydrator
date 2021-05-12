@@ -12,11 +12,11 @@ The basic idea here is: Ship a container image that contains:
 
 ## Try it now!
 
-An image is uploaded to `quay.io/cgwalters/fcos-images:stable`.  For example here
+An image is uploaded to `quay.io/cgwalters/fcos-images:v0.1.1` (also tagged `stable`).  For example here
 we extract the OpenStack image:
 
 ```
-$ podman run --rm -i quay.io/cgwalters/fcos-images:stable rehydrate - --disk openstack > fedora-coreos-openstack.x86_64.qcow2
+$ podman run --rm -i quay.io/cgwalters/fcos-images:v0.1.1 rehydrate - --disk openstack > fedora-coreos-openstack.x86_64.qcow2
 ```
 
 And now you can e.g. upload this image with [glance](https://docs.openstack.org/python-glanceclient/latest/cli/details.html).
@@ -24,7 +24,7 @@ And now you can e.g. upload this image with [glance](https://docs.openstack.org/
 There's more artifacts, for example use `--iso` to get the `metal` live ISO.
 
 We're using `-` to output to stdout, because it's more convenient than dealing with podman bind mounts.
-You can also use e.g. `podman run --rm -i -v .:/out:Z quay.io/cgwalters/fcos-images:stable rehydrate /out --disk openstack`
+You can also use e.g. `podman run --rm -i -v .:/out:Z quay.io/cgwalters/fcos-images:v0.1.1 rehydrate /out --disk openstack`
 to write to a directory that was bind mounted from the host.
 
 When extracting multiple things to stdout (e.g. `--iso --disk qemu` to get both the ISO
