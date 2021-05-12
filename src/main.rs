@@ -72,6 +72,13 @@ struct RehydrateOpts {
     dest: String,
 }
 
+#[derive(Debug, StructOpt, Default)]
+struct DehydrateOpts {
+    /// Do not fatally error if there are unhandled artifacts.
+    #[structopt(long)]
+    allow_unhandled: bool,
+}
+
 /// Commands used to dehydrate images
 #[derive(Debug, StructOpt)]
 #[structopt(rename_all = "kebab-case")]
@@ -84,7 +91,7 @@ enum Build {
     /// Download all supported images
     Download,
     /// Generate "dehydration files" from already downloaded files
-    Dehydrate,
+    Dehydrate(DehydrateOpts),
     /// Remove cached files
     Clean,
     /// Initialize, download, and dehydrate in one go
@@ -122,12 +129,12 @@ fn run() -> Result<()> {
         Opt::Build(b) => match b {
             Build::Init { ref stream } => build_init(stream.as_str()),
             Build::Download => download::build_download(),
-            Build::Dehydrate => build_dehydrate(),
+            Build::Dehydrate(ref opts) => build_dehydrate(opts),
             Build::Clean => build_clean(),
             Build::Run { ref stream } => {
                 build_init(stream.as_str())?;
                 download::build_download()?;
-                build_dehydrate()?;
+                build_dehydrate(&Default::default())?;
                 build_clean()?;
                 Ok(())
             }
@@ -607,10 +614,17 @@ fn dehydrate_ova(qemu: &Artifact, target: &Artifact, destdir: &Utf8Path) -> Resu
 }
 
 /// Loop over stream metadata and generate dehydrated (~deduplicated) content.
-fn build_dehydrate() -> Result<()> {
+fn build_dehydrate(opts: &DehydrateOpts) -> Result<()> {
     let stream_path = Utf8Path::new(STREAM_FILE);
     let s = read_stream()?;
     let riverdelta: RiverDelta = s.try_into()?;
+
+    if !opts.allow_unhandled && !riverdelta.unhandled.is_empty() {
+        return Err(anyhow!(
+            "Unhandled artifacts: {:?}",
+            riverdelta.unhandled.keys()
+        ));
+    }
 
     std::fs::create_dir_all(CACHEDIR).context("Creating cachedir")?;
 
@@ -703,6 +717,7 @@ fn build_dehydrate() -> Result<()> {
     );
 
     if !riverdelta.unhandled.is_empty() {
+        assert!(!opts.allow_unhandled);
         let s = std::io::stdout();
         let mut s = s.lock();
         write!(s, "Unhandled:")?;
