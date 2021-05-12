@@ -50,8 +50,9 @@ have the version number.  This information can currently be retrieved via the `p
 which outputs the [stream metadata](https://docs.fedoraproject.org/en-US/fedora-coreos/stream-metadata/)
 stored in the image.
 
-As of right now, the original (compressed) images total `4.55GiB`, and the container image is `1.63GiB`,
-so a savings of `64%` which isn't bad.  But there's more we can do here - see the issues list for details
+As of right now for Fedora CoreOS `stable`, the original (compressed) images total `8.34GiB`, and the container image is `1.77GiB`,
+so a savings of nearly `80%` which isn't bad.  Most importantly, adding new platforms will only incur
+a space hit of `~20MiB` and not `!700MiB`.  But there's more we can do here - see the issues list for details
 on ideas.
 
 We also aren't including all the images; e.g. `vmware` is doable but needs some `ova` handling.
