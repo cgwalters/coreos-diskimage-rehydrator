@@ -16,15 +16,19 @@ An image is uploaded to `quay.io/cgwalters/fcos-images:stable`.  For example her
 we extract the OpenStack image:
 
 ```
-$ podman run --rm -i quay.io/cgwalters/fcos-images:stable rehydrate --to-stdout --disk openstack > fedora-coreos-openstack.x86_64.qcow2
+$ podman run --rm -i quay.io/cgwalters/fcos-images:stable rehydrate - --disk openstack > fedora-coreos-openstack.x86_64.qcow2
 ```
 
 And now you can e.g. upload this image with [glance](https://docs.openstack.org/python-glanceclient/latest/cli/details.html).
 
 There's more artifacts, for example use `--iso` to get the `metal` live ISO.
 
-If you use `--to-stdout` when extracting multiple things (e.g. `--iso --disk qemu` to get both the ISO
-and `qemu.qcow2`, then the output stream will be a tarball you can extract via piping to `tar xf -`).
+We're using `-` to output to stdout, because it's more convenient than dealing with podman bind mounts.
+You can also use e.g. `podman run --rm -i -v .:/out:Z quay.io/cgwalters/fcos-images:stable rehydrate /out --disk openstack`
+to write to a directory that was bind mounted from the host.
+
+When extracting multiple things to stdout (e.g. `--iso --disk qemu` to get both the ISO
+and `qemu.qcow2`, or `--pxe`) then the output stream will be a tarball which you can extract via piping to `tar xf -`.
 
 Use `--help` to see other commands.  Notice in the above invocation, we chose the filename, and we also don't
 have the version number.  This information can currently be retrieved via the `print-stream-json` command,
