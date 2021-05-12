@@ -79,6 +79,7 @@ impl RiverDelta {
         once(&self.qemu)
             .chain(self.qemu_rsyncable_artifacts.values())
             .chain(self.aws.as_ref())
+            .chain(self.vmware.as_ref())
             .chain(
                 self.metal
                     .iter()
