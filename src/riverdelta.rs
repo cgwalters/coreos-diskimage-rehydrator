@@ -27,6 +27,7 @@ const RSYNC_STRATEGY_DISK: &[&str] = &[
 pub(crate) const QEMU: &str = "qemu";
 const METAL: &str = "metal";
 const AWS: &str = "aws";
+const VMWARE: &str = "vmware";
 
 /// Extension trait for Artifact.
 pub(crate) trait ArtifactExt {
@@ -56,6 +57,8 @@ pub(crate) struct RiverDelta {
     pub(crate) qemu_rsyncable_artifacts: HashMap<String, Artifact>,
     /// This is the VMDK, not the AMIs.
     pub(crate) aws: Option<Artifact>,
+    /// vmware image is an OVA, which needs special handling.
+    pub(crate) vmware: Option<Artifact>,
     /// The Live ISO and PXE data
     pub(crate) metal: Option<Metal>,
     /// Unhandled set.
@@ -177,6 +180,11 @@ impl TryFrom<Stream> for RiverDelta {
             .remove(AWS)
             .map(platform_disk_artifact)
             .transpose()?;
+        let vmware = thisarch
+            .artifacts
+            .remove(VMWARE)
+            .map(platform_disk_artifact)
+            .transpose()?;
         let (qemu_rsyncable_artifacts, unhandled): (HashMap<_, _>, HashMap<_, _>) = thisarch
             .artifacts
             .into_par_iter()
@@ -194,6 +202,7 @@ impl TryFrom<Stream> for RiverDelta {
             qemu,
             qemu_rsyncable_artifacts,
             aws,
+            vmware,
             metal,
             unhandled,
         })
