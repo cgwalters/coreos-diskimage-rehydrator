@@ -38,15 +38,6 @@ const METADATA_FILE: &str = "meta.json";
 /// Number of CPUs we'll use
 pub(crate) const N_WORKERS: u32 = 2;
 
-// TODO: aws.vmdk is internally compressed.  We need to replicate the qemu-img arguments,
-// and also handle the CID.
-
-// TODO: vmware.ova is a tarball - of metadata followed by the compressed disk image.
-// To handle this fully reproducibly we'd need to try to regenerate the tarball
-// bit-for bit which may be ugly.  But since we know nothing is *after* the disk image,
-// it might work to literally save the tar headers and then generate the vmdk, then
-// concatenate the two.
-
 #[derive(Debug, StructOpt)]
 struct RehydrateOpts {
     /// Extract the disk image for a specific platform
