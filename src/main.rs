@@ -36,7 +36,7 @@ const STREAM_FILE: &str = "stream.json";
 /// Name of metadata file
 const METADATA_FILE: &str = "meta.json";
 /// Number of CPUs we'll use
-pub(crate) const N_WORKERS: u32 = 2;
+pub(crate) const N_WORKERS: u32 = 3;
 
 #[derive(Debug, StructOpt)]
 struct RehydrateOpts {
