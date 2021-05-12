@@ -61,10 +61,6 @@ struct RehydrateOpts {
     #[structopt(long)]
     pxe: bool,
 
-    /// Don't recompress images
-    #[structopt(long)]
-    skip_compress: bool,
-
     /// Don't verify SHA-256 of generated images
     #[structopt(long)]
     skip_validate: bool,
