@@ -202,6 +202,18 @@ fn write_output<W: std::io::Write>(
     Ok(())
 }
 
+/// Generate a new temporary hardlink.
+///
+/// We do this gyration because most of our code ends up generating
+/// new files that we want to `rename()`.
+fn temp_hardlink(src: impl AsRef<Utf8Path>, tmpdir: impl AsRef<Utf8Path>) -> Result<Utf8PathBuf> {
+    let src = src.as_ref();
+    let tmpdir = tmpdir.as_ref();
+    let dest = tmpdir.join(src.file_name().unwrap());
+    std::fs::hard_link(src, &dest).with_context(|| anyhow!("Failed to hardlink {}", src))?;
+    Ok(dest)
+}
+
 fn finish_output<W: std::io::Write>(
     ctx: &RehydrateContext<W>,
     a: &Artifact,
@@ -231,11 +243,16 @@ fn finish_output<W: std::io::Write>(
 }
 
 fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
-    if opts.disk.is_empty() && !opts.iso {
+    let pxe_or_iso = opts.iso || opts.pxe;
+    if opts.disk.is_empty() && !pxe_or_iso {
         return Err(anyhow!("No images specified"));
     }
 
-    let have_multiple = (opts.iso && !opts.disk.is_empty()) || opts.disk.len() > 1;
+    let tmpdir = tempfile::tempdir_in(".")?;
+    let tmpdir: &Utf8Path = tmpdir.path().try_into()?;
+
+    // PXE is multiple things.
+    let have_multiple = opts.disk.len() > 1 || opts.pxe;
     let stdout = std::io::stdout();
     let is_stdout = opts.dest == "-";
     if is_stdout && nix::unistd::isatty(1)? {
@@ -272,9 +289,16 @@ fn rehydrate(opts: &RehydrateOpts) -> Result<(), anyhow::Error> {
         )?;
         finish_output(ctx, &metal.iso, iso_fn)?;
     }
-
     if opts.pxe {
-        todo!()
+        let metal = riverdelta
+            .metal
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing metal"))?;
+        for a in [&metal.pxe.kernel, &metal.pxe.initramfs, &metal.pxe.rootfs].iter() {
+            let src = srcdir.join(a.filename());
+            let tmp = temp_hardlink(src, tmpdir)?;
+            finish_output(ctx, a, &tmp)?;
+        }
     }
 
     if !opts.disk.is_empty() {
@@ -486,6 +510,12 @@ fn build_dehydrate() -> Result<()> {
         let rootfs_name = metal.pxe.rootfs.filename();
         hardlink(rootfs_name, destdir.join(rootfs_name))?;
         let _found: bool = rsync_delta(&metal.pxe.rootfs, &metal.iso, destdir)?;
+
+        // And handle the kernel/initramfs
+        for a in [&metal.pxe.kernel, &metal.pxe.initramfs].iter() {
+            let name = a.filename();
+            hardlink(name, destdir.join(name))?;
+        }
     }
 
     // Link in the qemu image now, we'll compress it at the end
