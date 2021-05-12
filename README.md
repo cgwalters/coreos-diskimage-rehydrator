@@ -1,14 +1,29 @@
 # CoreOS Disk Image Rehydrator
 
-Part of implementing https://github.com/openshift/enhancements/pull/201
+Part of implementing https://github.com/coreos/fedora-coreos-tracker/issues/828
+which is in turn part of https://github.com/openshift/enhancements/pull/201
 
-The basic idea here is: Ship a container image that contains:
+In CoreOS we ship a *lot* of disk images, one for each platform.  These
+are almost entirely the same thing, mostly just with an `ignition.platform.id`
+stamp in each disk image, wrapped in a hypervisor/platform specific container.
 
- - This executable
- - A "base image" used to generate others (may be qemu or ISO, see below)
- - Extra "recipe" sufficient to generate all the other disk images on demand, from
-   the `-qemu.qcow2` and the `-aws.vmdk` disk images, the `.iso` etc - but without
-   duplicating all the disk image data entirely as that would add up *fast*.
+Plus for bare metal, we ship both a "split out" PXE setup as well as an ISO,
+which are also the same thing.
+
+Today, users access this via stream metadata as documented here:
+https://docs.fedoraproject.org/en-US/fedora-coreos/stream-metadata/
+
+The goal of this project is to make our build and delivery pipeline more
+"container native" by creating a container image that de-duplicates
+all of those images, and can generate them on-demand.
+
+Specific goals:
+
+- Make offline mirroring much easier because an administrator can just mirror
+  this container image along with the other containers they want
+- Orient our release engineering to be more "container native" in general
+- Ensure this container image is signed, which then in turn means we have
+  a signature that covers all of our disk images.
 
 ## Try it now!
 
@@ -42,12 +57,15 @@ on ideas.
 We also aren't including all the images; e.g. `vmware` is doable but needs some `ova` handling.
 The more images we include here, the better the overall compression ratio will look.
 
-# Requirement: Bit-for-bit uncompressed SHA-256 match
+# Goal: Bit-for-bit uncompressed SHA-256 match
 
-Our CI tests the disk images.  In order to ensure that we're
-re-generating what we tested, it's very imporant that the
-uncompressed SHA-256 match.
+Our CI tests the disk images.  For example, we have extensive tests that exercise
+the live `.iso`, etc.
 
+In order to ensure that we're re-generating what we tested, ideally the uncompressed
+SHA-256 checksum matches.  
+
+However, this is not currently done for all formats.
 ## Image differences
 
 The `-openstack.qcow2` and the `-qemu.qcow2` only differ in the
