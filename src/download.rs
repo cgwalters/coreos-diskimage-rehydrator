@@ -46,6 +46,7 @@ pub(crate) fn build_download() -> Result<()> {
                     let temp_name = &format!("{}.tmp", fname);
                     let mut out = std::io::BufWriter::new(File::create(temp_name)?);
                     let mut resp = client.get(location).send()?;
+                    resp.error_for_status_ref()?;
                     resp.copy_to(&mut out)
                         .with_context(|| anyhow!("Failed to download {}", location))?;
                     std::fs::rename(temp_name, fname)?;
