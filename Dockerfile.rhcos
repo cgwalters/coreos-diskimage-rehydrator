@@ -1,0 +1,8 @@
+#FROM quay.io/cgwalters/coreos-diskimage-rehydrator
+FROM localhost/rehydrator
+# The directory dance here is because the current code is oriented
+# towards downloading the originals in the current dir, which should be fixed.
+RUN mkdir tmp && cd tmp && coreos-diskimage-rehydrator build run rhcos-4.8 \
+  && cd .. && mv tmp/coreos-images-dehydrated . && rm tmp -rf
+
+    
