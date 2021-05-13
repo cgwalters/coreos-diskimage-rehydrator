@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 use crate::riverdelta::{ArtifactExt, RiverDelta};
+use crate::streamid::stream_url_from_id;
 use anyhow::{anyhow, Context, Result};
 use camino::{Utf8Path, Utf8PathBuf};
 use coreos_stream_metadata::Artifact;
@@ -19,7 +20,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tracing::{debug, info};
-use crate::streamid::stream_url_from_id;
 
 mod download;
 mod ova;
@@ -150,6 +150,7 @@ fn build_init(stream: &str) -> Result<()> {
             .open(STREAM_FILE)?,
     );
     let mut resp = reqwest::blocking::get(&u)?;
+    resp.error_for_status_ref()?;
     resp.copy_to(&mut out)?;
     out.flush()?;
     Ok(())
