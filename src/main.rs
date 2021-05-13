@@ -82,7 +82,11 @@ enum Build {
         stream: String,
     },
     /// Download all supported images
-    Download,
+    Download {
+        /// Don't try to download signatures
+        #[structopt(long)]
+        skip_signatures: bool,
+    },
     /// Generate "dehydration files" from already downloaded files
     Dehydrate(DehydrateOpts),
     /// Remove cached files
@@ -121,12 +125,12 @@ fn run() -> Result<()> {
         }
         Opt::Build(b) => match b {
             Build::Init { ref stream } => build_init(stream.as_str()),
-            Build::Download => download::build_download(),
+            Build::Download { skip_signatures } => download::build_download(skip_signatures),
             Build::Dehydrate(ref opts) => build_dehydrate(opts),
             Build::Clean => build_clean(),
             Build::Run { ref stream } => {
                 build_init(stream.as_str())?;
-                download::build_download()?;
+                download::build_download(false)?;
                 build_dehydrate(&Default::default())?;
                 build_clean()?;
                 Ok(())

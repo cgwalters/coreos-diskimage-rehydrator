@@ -1,4 +1,4 @@
-use crate::riverdelta::{ArtifactExt, RiverDelta};
+use crate::riverdelta::{self, ArtifactExt, RiverDelta};
 use anyhow::{anyhow, Context, Result};
 use camino::Utf8Path;
 use rayon::prelude::*;
@@ -7,8 +7,11 @@ use std::convert::TryInto;
 use std::fs::File;
 use tracing::info;
 
-pub(crate) fn build_download() -> Result<()> {
-    let s = crate::read_stream()?;
+pub(crate) fn build_download(skip_signatures: bool) -> Result<()> {
+    let mut s = crate::read_stream()?;
+    if skip_signatures {
+        riverdelta::stream_remove_signatures(&mut s)?;
+    }
     let riverdelta: RiverDelta = s.try_into()?;
     let client = reqwest::blocking::ClientBuilder::new()
         .user_agent(concat!(
