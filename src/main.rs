@@ -19,12 +19,14 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use structopt::StructOpt;
 use tracing::{debug, info};
+use crate::streamid::stream_url_from_id;
 
 mod download;
 mod ova;
 mod qemu_img;
 mod riverdelta;
 mod rsync;
+mod streamid;
 mod utils;
 
 /// The target directory
@@ -136,7 +138,7 @@ fn run() -> Result<()> {
 
 /// Initialize directory with stream data
 fn build_init(stream: &str) -> Result<()> {
-    let u = coreos_stream_metadata::stream_url_from_id(stream)?;
+    let u = stream_url_from_id(stream)?;
     if Utf8Path::new(STREAM_FILE).exists() {
         return Err(anyhow!("{} exists, not overwriting", STREAM_FILE));
     }

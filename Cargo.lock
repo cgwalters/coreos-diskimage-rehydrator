@@ -214,6 +214,8 @@ dependencies = [
  "serde_json",
  "smallvec",
  "structopt",
+ "strum",
+ "strum_macros",
  "tar",
  "tempfile",
  "tracing",
@@ -225,7 +227,7 @@ dependencies = [
 [[package]]
 name = "coreos-stream-metadata"
 version = "0.1.0"
-source = "git+https://github.com/cgwalters/stream-metadata-rust?rev=f23ee489a965ad4cc37ff549a75945c24aa0356a#f23ee489a965ad4cc37ff549a75945c24aa0356a"
+source = "git+https://github.com/coreos/stream-metadata-rust?rev=676fd60f218556a6b2ff913685e74ad6015c2b2c#676fd60f218556a6b2ff913685e74ad6015c2b2c"
 dependencies = [
  "anyhow",
  "nix",
