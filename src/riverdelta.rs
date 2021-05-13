@@ -110,6 +110,24 @@ impl RiverDelta {
     }
 }
 
+/// Remove all signatures from a stream.
+pub(crate) fn stream_remove_signatures(s: &mut Stream) -> Result<()> {
+    let utsname = nix::sys::utsname::uname();
+    let thisarch_name = utsname.machine();
+    let thisarch = s
+        .architectures
+        .get_mut(thisarch_name)
+        .ok_or_else(|| anyhow::anyhow!("Missing this architecture in stream metadata"))?;
+    for platform in thisarch.artifacts.values_mut() {
+        for format in platform.formats.values_mut() {
+            for artifact in format.values_mut() {
+                artifact.signature = None;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_artifact(a: Artifact) -> Result<Artifact> {
     if Utf8Path::new(a.location.as_str()).file_name().is_none() {
         return Err(anyhow!("Missing filename in {}", a.location));
